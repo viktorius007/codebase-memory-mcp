@@ -2651,8 +2651,37 @@ static bool pxc_python_submodule_loaded_first(const cbm_gbuf_node_t *owner,
  * pxc_python_star_may_bind_hook), or a submodule `member` the import
  * system loads for `from <package> import <member>`
  * (pxc_python_package_has_submodule). */
+/* Whether the export set of a module with facts `facts` is known from its
+ * own statements: it has no star import, any-name binder, or other binding
+ * of `__all__` (an import of it, a branch binding it), or else a literal
+ * `__all__` assignment comes after every such fact and no `__all__` binder
+ * but a literal append follows it. A star or an imported `__all__` may
+ * bring names, `__getattr__` and `__all__` included, from elsewhere. */
+static bool pxc_python_exports_known(const CBMPyNamespaceFacts *facts) {
+    int last_foreign = -1; /* last star, any-name or non-literal `__all__` binder */
+    int last_set = -1;     /* last literal `__all__ = [...]` */
+    bool tail_literal = true;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        const char *name = fact->local_name;
+        bool foreign =
+            fact->kind == CBM_PY_NS_IMPORT_STAR ||
+            (name && (strcmp(name, CBM_PY_NS_ANY_NAME) == 0 || strcmp(name, "__all__") == 0));
+        if (foreign) {
+            last_foreign = i;
+        } else if (fact->kind == CBM_PY_NS_ALL_SET) {
+            last_set = i;
+            tail_literal = true;
+        } else if (fact->kind == CBM_PY_NS_ALL_UNKNOWN || fact->kind == CBM_PY_NS_ALL_DELETE) {
+            tail_literal = false;
+        }
+    }
+    return last_foreign < 0 || (last_set > last_foreign && tail_literal);
+}
+
 /* Whether the star import `fact` of `owner` may bind `__getattr__`: its
- * source is not a located module with readable facts, or its export set may
+ * source is not a located module with readable facts, its export set is not
+ * known from its own statements (pxc_python_exports_known), or that set may
  * hold the name (a literal `__all__` listing it, or an `__all__` that is not
  * literal); with no `__all__` an underscore name is not exported. */
 static bool pxc_python_star_may_bind_hook(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
@@ -2666,8 +2695,9 @@ static bool pxc_python_star_may_bind_hook(PXCPythonResolver *pr, const cbm_gbuf_
                                    fact->module_name, star) ||
         !pxc_python_module_facts(pr, pxc_python_owner_module(pr->ctx->gbuf, star), &star_facts))
         return true;
-    bool known = true;
-    return pxc_python_name_is_exported(&star_facts, "__getattr__", NULL, &known) || !known;
+    bool known = pxc_python_exports_known(&star_facts);
+    return !known || pxc_python_name_is_exported(&star_facts, "__getattr__", NULL, &known) ||
+           !known;
 }
 
 static bool pxc_python_unbound_has_fallback(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
