@@ -16523,6 +16523,9 @@ static const char *rust_unbracketed_path(RustLSPContext *ctx, TSNode callee) {
 static const CBMRegisteredFunc *rust_sole_blanket_impl_method(RustLSPContext *ctx,
                                                               const char *type_qn,
                                                               const char *name);
+static const CBMRegisteredFunc *rust_sole_default_declaration(RustLSPContext *ctx,
+                                                              const char *type_qn,
+                                                              const char *name);
 
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
@@ -16599,6 +16602,8 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
         if (!rust_ufcs_target(ctx, qn, callee, out)) {
             const CBMRegisteredFunc *blanket =
                 r.is_trait ? NULL : rust_sole_blanket_impl_method(ctx, r.qn, r.assoc);
+            if (!blanket && !r.is_trait)
+                blanket = rust_sole_default_declaration(ctx, r.qn, r.assoc);
             if (blanket) {
                 rust_call_target_set(out, blanket, blanket->qualified_name, "lsp_trait_dispatch",
                                      CBM_RUST_CONF_UFCS);
@@ -17524,6 +17529,40 @@ static const CBMRegisteredFunc *rust_sole_blanket_impl_method(RustLSPContext *ct
         selected = blanket;
     }
     return selected;
+}
+
+/* `Type::name` where the project type `Type` registers no `name` and no
+ * blanket supplies it: the one in-scope corpus trait declaring `name` with a
+ * default body that no corpus impl of the trait overrides is the callee (its
+ * impl for `Type` is derived or otherwise unseen, and inherits the body).
+ * Named assumption: a derive never writes that method. NULL when the trait
+ * is not unique, the declaration has no body, or some impl defines `name`. */
+static const CBMRegisteredFunc *rust_sole_default_declaration(RustLSPContext *ctx,
+                                                              const char *type_qn,
+                                                              const char *name) {
+    for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
+        if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], name) == 0)
+            return NULL;
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!type || type->is_interface || type->alias_of)
+        return NULL;
+    const CBMRegisteredFunc *declaration = rust_sole_in_scope_trait_declaration(ctx, name);
+    if (!declaration || !declaration->receiver_type ||
+        (declaration->flags & CBM_FUNC_FLAG_RUST_ABSTRACT) != 0 ||
+        rust_trait_blanket_method(ctx, declaration->receiver_type, name))
+        return NULL;
+    const char *trait_qn = declaration->receiver_type;
+    const char *tdot = strrchr(trait_qn, '.');
+    CBMTypeEmbedIter eit;
+    cbm_registry_types_by_embedded_bare(ctx->registry, tdot ? tdot + 1 : trait_qn, &eit);
+    for (int ti; (ti = cbm_type_embed_iter_next(&eit)) >= 0;) {
+        const CBMRegisteredType *t = &ctx->registry->types[ti];
+        if (t->qualified_name &&
+            rust_registry_lookup_trait_impl_method(ctx->registry, t->qualified_name, trait_qn,
+                                                   name, NULL))
+            return NULL; /* an override: the unseen impl may write one too */
+    }
+    return declaration;
 }
 
 /* The trait declaration of method `method` called on a fn item or tuple

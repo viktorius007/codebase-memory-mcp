@@ -1,0 +1,1 @@
+Lane w6-recv (2026-10-26): `Type::name()` whose impl inherits the trait's default body (bevy `SimpleState::register_state` through FreelyMutableState) links the declaration. println! statements print a backtrace (the run is the truth).
