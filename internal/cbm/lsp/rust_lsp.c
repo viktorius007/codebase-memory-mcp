@@ -19224,6 +19224,19 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     int saved_bound_count = ctx->type_param_bound_count;
     rust_collect_item_bounds(ctx, impl_node);
+    /* A std generic self (`impl<T: Tr> Tr for Option<Arc<T>>`) has no
+     * corpus declaration to read its arguments from: `self` keeps them as
+     * written (read once the impl's own parameters are in scope), so a
+     * pattern or loop over it binds the element type. */
+    if (!is_blanket && !ctx->self_value_type &&
+        strcmp(ts_node_type(type_node), "generic_type") == 0 &&
+        rust_type_is_std_trait(cbm_type_named(ctx->arena, effective_recv))) {
+        const CBMType *written = rust_parse_type_node(ctx, type_node);
+        if (written && written->kind == CBM_TYPE_TEMPLATE &&
+            strcmp(written->data.template_type.template_name, effective_recv) == 0) {
+            ctx->self_value_type = written;
+        }
+    }
 
     /* The Method node is keyed by this file's module and the implementing
      * type's base name (extract_rust_impl), not by the resolved receiver:
