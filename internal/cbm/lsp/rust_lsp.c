@@ -11296,10 +11296,106 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
     return exported ? exported : reexported;
 }
 
+static const char *rust_source_path_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               const char **crate_path);
+
+/* `$crate` of a crate the invoking crate has no dependency key for: an
+ * identifier that names the crate root file `root` (hex-encoded QN) and that
+ * only rust_modtree_macro_text reads back. Other paths it heads resolve to
+ * nothing, as an unknown crate head does. */
+static const char RUST_CRATE_MARK[] = "__cbm_crate_";
+
+static const char *rust_crate_mark(RustLSPContext *ctx, const char *root) {
+    size_t len = strlen(root);
+    char *out = (char *)cbm_arena_alloc(ctx->arena, sizeof(RUST_CRATE_MARK) + len * 2);
+    if (!out)
+        return NULL;
+    memcpy(out, RUST_CRATE_MARK, sizeof(RUST_CRATE_MARK) - 1);
+    for (size_t i = 0; i < len; i++)
+        snprintf(out + sizeof(RUST_CRATE_MARK) - 1 + i * 2, 3, "%02x", (unsigned char)root[i]);
+    return out;
+}
+
+/* The crate root file QN a path headed by rust_crate_mark names, with
+ * `*rest` the path after the head; NULL for any other path. */
+static const char *rust_crate_mark_root(RustLSPContext *ctx, const char *path, const char **rest) {
+    size_t mark = sizeof(RUST_CRATE_MARK) - 1;
+    const char *sep = strncmp(path, RUST_CRATE_MARK, mark) == 0 ? strstr(path, "::") : NULL;
+    size_t hex = sep ? (size_t)(sep - path) - mark : 0;
+    char *root = hex > 0 && hex % 2 == 0 ? (char *)cbm_arena_alloc(ctx->arena, hex / 2 + 1) : NULL;
+    for (size_t i = 0; root && i < hex / 2; i++) {
+        unsigned int byte = 0;
+        if (sscanf(path + mark + i * 2, "%2x", &byte) != 1)
+            return NULL;
+        root[i] = (char)byte;
+    }
+    if (!root)
+        return NULL;
+    root[hex / 2] = '\0';
+    *rest = sep + 2;
+    return root;
+}
+
+/* The `#[macro_export]` macro_rules! item the crate module tree resolves
+ * the path `macro_name` to at `invocation`, through `use` items and glob
+ * import chains (a glob the tree cannot read leaves the name open and
+ * withholds). `$crate` then reads as `crate` inside the defining crate, as
+ * the dependency key the invoking crate binds to it, or else as
+ * rust_crate_mark: `$crate` names the defining crate whatever the invoking
+ * crate's dependencies are. */
+static const char *rust_modtree_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                           TSNode invocation, const char **crate_path) {
+    const CBMRustModTree *tree = ctx->imports->modtree;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        ts_node_is_null(invocation) || !rust_original_offset(ctx, invocation, &offset))
+        return NULL;
+    const char *rest = NULL;
+    const char *marked = rust_crate_mark_root(ctx, macro_name, &rest);
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        marked ? cbm_rust_modtree_resolve_macro(tree, ctx->arena, marked, 0,
+                                                cbm_arena_sprintf(ctx->arena, "crate::%s", rest),
+                                                NULL, NULL, 0)
+               : cbm_rust_modtree_resolve_macro(
+                     tree, ctx->arena, ctx->module_qn, offset, macro_name,
+                     block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                     block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL, block_uses);
+    const char *root = r.kind == CBM_RUST_PATH_NOT_FUNCTION && r.qn
+                           ? module_parent_qn(ctx, r.qn)
+                           : NULL;
+    if (!root || !cbm_rust_modtree_has_file(tree, root))
+        return NULL;
+    const char *prefix = module_parent_qn(ctx, root);
+    const char *text =
+        prefix ? rust_exported_macro_text(ctx->imports->macros, prefix, strrchr(r.qn, '.') + 1)
+               : NULL;
+    if (!text)
+        return NULL;
+    const char *own = rust_crate_root_prefix(ctx);
+    const char *dependency = cbm_rust_modtree_crate_name(tree, root);
+    const char *dependency_root =
+        dependency ? cbm_rust_modtree_extern_root(tree, ctx->module_qn, dependency) : NULL;
+    if (own && strcmp(own, prefix) == 0)
+        *crate_path = "crate";
+    else if (dependency_root && strcmp(dependency_root, root) == 0 &&
+             !rust_head_bound_locally(ctx, dependency, true))
+        *crate_path = dependency;
+    else
+        *crate_path = rust_crate_mark(ctx, root);
+    return *crate_path ? text : NULL;
+}
+
 /* The macro_rules! item an invocation of `macro_name` names through path
  * scope: the written path, or the innermost `use` binding its single
- * segment. */
+ * segment, else what the crate module tree resolves the path to. */
 static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               TSNode invocation, const char **crate_path) {
+    const char *text = rust_source_path_macro_text(ctx, macro_name, crate_path);
+    return text ? text : rust_modtree_macro_text(ctx, macro_name, invocation, crate_path);
+}
+
+static const char *rust_source_path_macro_text(RustLSPContext *ctx, const char *macro_name,
                                                const char **crate_path) {
     if (strstr(macro_name, "::")) {
         bool relative = strncmp(macro_name, "crate::", 7) == 0 ||
@@ -11349,7 +11445,7 @@ static RustMacroRule *rust_macro_definition_for(RustLSPContext *ctx, const char 
     /* The `use` bindings in scope differ between invocations, so the path
      * is resolved each time and only the parsed definition is shared. */
     const char *crate_path = NULL;
-    const char *text = rust_path_scoped_macro_text(ctx, macro_name, &crate_path);
+    const char *text = rust_path_scoped_macro_text(ctx, macro_name, invocation, &crate_path);
     if (!text)
         return NULL;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
@@ -11597,6 +11693,38 @@ static int macro_consume_string(const char *s, int len, int from) {
     return from;
 }
 
+/* Whether the type text s[from, at) already forms a complete type: it ends
+ * in a path segment, a closed generic list or a closed group, and not in
+ * what a type still continues after: a reference's lifetime (`&'a [T]`), a
+ * function type's arrow (`fn() -> [T; 1]`), or a keyword (`&mut [T]`,
+ * `*const [T]`, `dyn`, `impl`). */
+static bool macro_type_complete(const char *s, int from, int at) {
+    int end = at;
+    while (end > from && isspace((unsigned char)s[end - 1]))
+        end--;
+    if (end == from)
+        return false;
+    char last = s[end - 1];
+    if (last == '>')
+        return !(end - 1 > from && s[end - 2] == '-');
+    if (last == ')' || last == ']')
+        return true;
+    if (!(isalnum((unsigned char)last) || last == '_'))
+        return false;
+    int start = end;
+    while (start > from && (isalnum((unsigned char)s[start - 1]) || s[start - 1] == '_'))
+        start--;
+    if (start > from && s[start - 1] == '\'')
+        return false;
+    static const char *const continuing[] = {"mut", "const", "dyn", "impl"};
+    for (size_t i = 0; i < sizeof(continuing) / sizeof(continuing[0]); i++) {
+        if ((size_t)(end - start) == strlen(continuing[i]) &&
+            memcmp(s + start, continuing[i], (size_t)(end - start)) == 0)
+            return false;
+    }
+    return true;
+}
+
 static int macro_consume_fragment(const char *s, int len, int from, const char *frag) {
     from = macro_skip_ws(s, len, from);
     if (from >= len)
@@ -11682,11 +11810,32 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         return from;
     }
     /* For expr/ty/path/pat/stmt: greedy balanced span up to a token none
-     * of them holds outside brackets (`,` `;` `=>`). */
+     * of them holds outside brackets (`,` `;` `=>`). A type or path also
+     * holds `,` and `=` inside its generic arguments, and ends before a `[`
+     * or `{` that follows a completed type (the reference's follow set of
+     * `ty` and `path` admits both). */
     bool item = strcmp(frag, "item") == 0;
+    bool typed = strcmp(frag, "ty") == 0 || strcmp(frag, "path") == 0;
+    int angle = 0;
     int p = from;
     while (p < len) {
         char c = s[p];
+        if (typed && c == '<') {
+            angle++;
+            p++;
+            continue;
+        }
+        if (typed && c == '>' && angle > 0 && !(p > from && s[p - 1] == '-')) {
+            angle--;
+            p++;
+            continue;
+        }
+        if (typed && angle == 0 && (c == '[' || c == '{') && macro_type_complete(s, from, p))
+            break;
+        if (angle > 0 && (c == ',' || c == '=' || c == ';')) {
+            p++;
+            continue;
+        }
         int string_end = macro_consume_string(s, len, p);
         if (string_end > p) {
             p = string_end;
@@ -17234,7 +17383,9 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
             callee = inner;
         }
     }
+    TSNode receiver = {0};
     if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "field_expression") == 0) {
+        receiver = ts_node_child_by_field_name(callee, "value", 5);
         callee = ts_node_child_by_field_name(callee, "field", 5);
     } else if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "scoped_identifier") == 0) {
         callee = ts_node_child_by_field_name(callee, "name", 4);
@@ -17244,6 +17395,18 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
                               &mapped_start, &mapped_end)) {
         ctx->emit_callee_start_byte = mapped_start;
         ctx->emit_callee_end_byte = mapped_end;
+        /* A transcriber that assembles `$receiver.$method(..)` from captured
+         * fragments: the receiver and the method name are call-site tokens,
+         * so the call is the call site's, at the method name. */
+        uint32_t receiver_start = 0;
+        uint32_t receiver_end = 0;
+        if (ctx->emit_site_end_byte == 0 && !ts_node_is_null(receiver) &&
+            rust_map_source_range(ctx, ts_node_start_byte(receiver), ts_node_end_byte(receiver),
+                                  &receiver_start, &receiver_end) &&
+            receiver_end <= mapped_start) {
+            ctx->emit_site_start_byte = receiver_start;
+            ctx->emit_site_end_byte = mapped_end;
+        }
     }
     rust_resolve_call_expression_inner(ctx, node);
     ctx->emit_site_start_byte = saved_start;
