@@ -1082,6 +1082,51 @@ static void rmf_scan_impl(RmfScan *scan, TSNode impl) {
     }
 }
 
+/* `bitflags! { $vis struct Name: Ty { .. } .. }` (the external bitflags
+ * crate) declares each `struct Name` at item position, so the tree names
+ * the type the module's own `impl Trait for Name` blocks attach to. Only the
+ * struct enters; the macro's generated impls stay unseen, and the module
+ * keeps its may-declare-unseen-names fact. `pub(..)` reads as crate-wide,
+ * wider than declared (see rmf_visibility). */
+static void rmf_scan_bitflags(RmfScan *scan, TSNode invocation) {
+    TSNode macro = ts_node_child_by_field_name(invocation, "macro", 5);
+    const char *path =
+        ts_node_is_null(macro) ? NULL : cbm_node_text(&scan->facts->arena, macro, scan->source);
+    const char *leaf = path ? strrchr(path, ':') : NULL;
+    leaf = leaf ? leaf + 1 : path;
+    TSNode tokens = cbm_find_child_by_kind(invocation, "token_tree");
+    if (!leaf || strcmp(leaf, "bitflags") != 0 || ts_node_is_null(tokens))
+        return;
+    size_t struct_kind = 0;
+    while (strcmp(RMT_ITEM_KINDS[struct_kind].node_kind, "struct_item") != 0)
+        struct_kind++;
+    uint32_t count = ts_node_child_count(tokens);
+    for (uint32_t i = 0; i + 1 < count; i++) {
+        TSNode token = ts_node_child(tokens, i);
+        TSNode next = ts_node_child(tokens, i + 1);
+        const char *text = cbm_node_text(&scan->facts->arena, token, scan->source);
+        if (!text || strcmp(text, "struct") != 0 || strcmp(ts_node_type(next), "identifier") != 0)
+            continue;
+        int8_t vis = 0;
+        const char *before =
+            i >= 1 ? cbm_node_text(&scan->facts->arena, ts_node_child(tokens, i - 1), scan->source)
+                   : NULL;
+        const char *before2 =
+            i >= 2 ? cbm_node_text(&scan->facts->arena, ts_node_child(tokens, i - 2), scan->source)
+                   : NULL;
+        if (before && strcmp(before, "pub") == 0)
+            vis = RMT_VIS_PUB;
+        else if (before && before[0] == '(' && before2 && strcmp(before2, "pub") == 0)
+            vis = RMT_VIS_CRATE;
+        rmf_push(scan, (RmfRecord){.op = RMF_ITEM,
+                                   .item = (uint8_t)struct_kind,
+                                   .vis = vis,
+                                   .line = ts_node_start_point(invocation).row + 1,
+                                   .start = ts_node_start_byte(invocation),
+                                   .name = cbm_node_text(&scan->facts->arena, next, scan->source)});
+    }
+}
+
 static void rmf_scan_item(RmfScan *scan, TSNode item) {
     const char *kind = ts_node_type(item);
     if (rmf_scan_proc_macro(scan, item))
@@ -1107,6 +1152,7 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
         rmf_scan_extern_crate(scan, item);
     } else if (strcmp(kind, "macro_invocation") == 0) {
         rmf_push(scan, (RmfRecord){.op = RMF_MACRO});
+        rmf_scan_bitflags(scan, item);
         if (!rmf_scan_macro_items(scan, item))
             rmf_scan_macro_mod_candidates(scan, item);
     } else {
