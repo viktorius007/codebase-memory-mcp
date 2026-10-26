@@ -1,0 +1,1 @@
+Written for lane w4-macro: macro_rules! matchers that space the fragment specifier (`$expr: expr`, `$( $item : expr ),*`), as bevy_render/macros/src/specializer.rs's guard! does; rustc reads `$name : frag` as the same three tokens. Calls in the arguments print their backtrace (the run is the truth).

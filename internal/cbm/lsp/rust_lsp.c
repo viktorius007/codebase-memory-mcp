@@ -11050,8 +11050,10 @@ static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, co
  * function body so any calls inside the body are attributed to the
  * enclosing function of the invocation site.
  *
- * Recursion guard caps expansion depth at 8 (matches the rustc
- * default for macro recursion safety). */
+ * Recursion guard: RUST_MACRO_MAX_EXPANSION_DEPTH nested expansions and
+ * argument re-parses. One level of bevy's `children![..]` costs three
+ * (children!, related!, recursive_spawn!), and bevy nests it five deep. */
+enum { RUST_MACRO_MAX_EXPANSION_DEPTH = 16 };
 
 typedef struct RustMacroRule {
     const char *macro_name;
@@ -12564,7 +12566,8 @@ static bool macro_env_record_reps(MacroEnv *env, const char *body, int body_len,
             continue;
         int ns = macro_skip_ws(body, body_len, p + 1);
         int ne = macro_consume_ident(body, body_len, ns);
-        if (ne == ns || ne >= body_len || body[ne] != ':')
+        int colon = macro_skip_ws(body, body_len, ne);
+        if (ne == ns || colon >= body_len || body[colon] != ':')
             continue;
         if (env->rep_count >= RUST_MACRO_MAX_REPS)
             return false;
@@ -12692,9 +12695,11 @@ static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_
         if (name_end == name_start)
             return MACRO_UNMODELLED;
         char frag[16] = "tt";
-        if (pp < pat_len && pat[pp] == ':') {
-            int frag_start = ++pp;
-            pp = macro_consume_ident(pat, pat_len, pp);
+        /* `$name:frag` is three tokens; `$expr: expr` spaces them. */
+        int colon = macro_skip_ws(pat, pat_len, pp);
+        if (colon < pat_len && pat[colon] == ':') {
+            int frag_start = macro_skip_ws(pat, pat_len, colon + 1);
+            pp = macro_consume_ident(pat, pat_len, frag_start);
             int fl = pp - frag_start;
             if (fl <= 0 || fl >= (int)sizeof(frag))
                 return MACRO_UNMODELLED;
@@ -13766,7 +13771,7 @@ static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
 static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname)
         return false;
-    if (ctx->macro_expand_depth >= 8)
+    if (ctx->macro_expand_depth >= RUST_MACRO_MAX_EXPANSION_DEPTH)
         return false;
 
     RustMacroRule *hit = NULL;
@@ -14363,7 +14368,7 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
                                          RustMacroArgForm form) {
     if (!ctx || ts_node_is_null(invocation))
         return;
-    if (ctx->macro_expand_depth >= 8)
+    if (ctx->macro_expand_depth >= RUST_MACRO_MAX_EXPANSION_DEPTH)
         return;
 
     /* The grammar exposes the argument list as a `token_tree` child rather
@@ -14491,6 +14496,7 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
         const char *quals; /* space-separated crate paths; "" alone = unqualified only */
         RustMacroArgForm form;
         bool check_import;
+        bool import_only; /* unqualified only when a `use` names one of `quals` */
     } table[] = {
         /* std::fmt defines positional expressions and `name = expression`:
          * https://doc.rust-lang.org/std/fmt/#named-parameters
@@ -14554,6 +14560,21 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
         {"execute", "crossterm", RUST_MACRO_ARGS_EXPR_LIST},
         {"line", "ratatui ratatui_macros", RUST_MACRO_ARGS_ARRAY_BODY},
         {"text", "ratatui ratatui_macros", RUST_MACRO_ARGS_ARRAY_BODY},
+        /* approx: `lhs, rhs [, name = expression]*`
+         * https://docs.rs/approx/latest/approx/#macros
+         * No prelude defines these names, so a bare one needs its `use`. */
+        {"assert_abs_diff_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_abs_diff_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_relative_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_relative_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_ulps_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_ulps_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"abs_diff_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"abs_diff_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"relative_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"relative_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"ulps_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"ulps_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strcmp(leaf, table[i].leaf) != 0)
@@ -14566,6 +14587,8 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
             if (imported)
                 return strstr(imported, "::") &&
                        rust_builtin_macro_arg_form(ctx, imported, form);
+            if (table[i].import_only)
+                return false;
             *form = table[i].form;
             return true;
         }

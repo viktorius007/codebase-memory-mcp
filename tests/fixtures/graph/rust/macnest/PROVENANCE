@@ -1,0 +1,1 @@
+Written for lane w4-macro: bevy's `children![..]` nested five deep (bevy examples/ui/ui_transform.rs). Each level expands through three `#[macro_export]` macro_rules! (`children!` to `$crate::related!` to `$crate::recursive_spawn!`), so a call in the fifth level's arguments sits fifteen expansions down; calls at every level print their backtrace (the run is the truth).
