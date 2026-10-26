@@ -16882,6 +16882,61 @@ static const CBMType *rust_expected_argument_type(RustLSPContext *ctx, TSNode ca
     return callee->signature->data.func.param_types[index];
 }
 
+/* The declared type of the position `arg` fills in a tuple-struct or
+ * tuple-variant constructor call (`Wrap(..)`, `Self(..)`, `E::V(..)`,
+ * `Self::V(..)`): the struct's field `<i>` or the enum's `V.<i>`, as
+ * pxc_fold_rust_payload_fields registers them. `*type_params` receives the
+ * type's own parameters. NULL for any other call. */
+static const CBMType *rust_expected_tuple_ctor_field(RustLSPContext *ctx, TSNode call,
+                                                    TSNode arg, TSNode args,
+                                                    const char ***type_params) {
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(fn) || (strcmp(ts_node_type(fn), "identifier") != 0 &&
+                                strcmp(ts_node_type(fn), "scoped_identifier") != 0)) {
+        return NULL;
+    }
+    int index = -1;
+    int position = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(args); i++) {
+        TSNode child = ts_node_named_child(args, i);
+        if (rust_is_comment_node(child)) {
+            continue;
+        }
+        if (ts_node_eq(child, arg)) {
+            index = position;
+            break;
+        }
+        position++;
+    }
+    char *path = index >= 0 ? rust_node_text(ctx, fn) : NULL;
+    if (!path) {
+        return NULL;
+    }
+    const char *owner = NULL;
+    const char *field = cbm_arena_sprintf(ctx->arena, "%d", index);
+    char *sep = strstr(path, "::");
+    if (strcmp(path, "Self") == 0) {
+        owner = ctx->self_type_qn;
+    } else if (strcmp(ts_node_type(fn), "identifier") == 0) {
+        owner = rust_resolve_path_expr(ctx, path);
+    } else if (sep && !strstr(sep + 2, "::")) {
+        /* `E::V` / `Self::V`: the enum and its variant's position. */
+        *sep = '\0';
+        owner = strcmp(path, "Self") == 0 ? ctx->self_type_qn : rust_resolve_path_expr(ctx, path);
+        field = cbm_arena_sprintf(ctx->arena, "%s.%d", sep + 2, index);
+    }
+    const CBMRegisteredType *rt = owner ? rust_lookup_type_variants(ctx, owner) : NULL;
+    if (!rt || rt->is_interface) {
+        return NULL;
+    }
+    const CBMType *t = rust_lookup_field(ctx, rt->qualified_name, field, 0);
+    if (!t) {
+        return NULL;
+    }
+    *type_params = rt->type_param_names;
+    return t;
+}
+
 /* True when `t` names a type the call site does not prove: unknown, `Self`
  * or a path under it, a masked type parameter (`_`), or a parameter in
  * `params` (the callee's impl parameters) left unsubstituted. */
@@ -17225,18 +17280,61 @@ static const CBMType *rust_expected_return_type(RustLSPContext *ctx, TSNode expr
     return ts_node_is_null(ret) ? NULL : rust_parse_type_node(ctx, ret);
 }
 
-/* Registered QN of the declared type `expr` is expected to have, or NULL. */
-static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
+enum { RUST_EXPECTED_MAX_DEPTH = 8 };
+static const CBMType *rust_expected_tuple_element(RustLSPContext *ctx, TSNode tuple, TSNode elem,
+                                                  const char ***type_params, int depth);
+static const CBMType *rust_expected_closure_value(RustLSPContext *ctx, TSNode closure,
+                                                  TSNode body);
+static const CBMType *rust_expected_type(RustLSPContext *ctx, TSNode expr,
+                                         const char ***type_params_out, int depth);
+
+/* A struct literal's field declared through the struct's own parameters
+ * (`filter: F` in `Builder<'w, F>`), read with the arguments the literal's
+ * own position declares (`-> Builder<'_, OptOut>`). `field` unchanged when
+ * the literal's position declares no instance of `owner`. */
+static const CBMType *rust_expected_literal_field(RustLSPContext *ctx, TSNode literal,
+                                                  const char *owner, const char **params,
+                                                  const CBMType *field, int depth) {
+    const char **outer_params = NULL;
+    const CBMType *outer = rust_expand_type_aliases(
+        ctx, rust_expected_type(ctx, literal, &outer_params, depth + 1), 0);
+    if (outer && outer->kind == CBM_TYPE_NAMED &&
+        strcmp(outer->data.named.qualified_name, "Self") == 0 && ctx->self_value_type) {
+        outer = ctx->self_value_type;
+    }
+    if (!outer || outer->kind != CBM_TYPE_TEMPLATE) {
+        return field;
+    }
+    const CBMRegisteredType *declared =
+        rust_lookup_type_variants(ctx, outer->data.template_type.template_name);
+    if (!declared || strcmp(declared->qualified_name, owner) != 0) {
+        return field;
+    }
+    int count = 0;
+    while (params[count]) {
+        count++;
+    }
+    if (count != outer->data.template_type.arg_count) {
+        return field;
+    }
+    return rust_subst_receiver_args(ctx, field, (const char *const *)params,
+                                    outer->data.template_type.template_args, count, NULL, 0);
+}
+
+/* The type the position of `expr` declares for it, or NULL: a struct field
+ * value, a call or tuple-constructor argument, an annotated `let`, a tuple
+ * element or a borrow of such a position, the value a std closure adapter
+ * returns (`or_insert_with(|| v)`), and a function's return value.
+ * `*type_params` receives the parameters a declaring item leaves open. */
+static const CBMType *rust_expected_type(RustLSPContext *ctx, TSNode expr,
+                                         const char ***type_params_out, int depth) {
     TSNode parent = ts_node_parent(expr);
-    if (ts_node_is_null(parent)) {
+    if (ts_node_is_null(parent) || depth > RUST_EXPECTED_MAX_DEPTH) {
         return NULL;
     }
     const char *pk = ts_node_type(parent);
     const CBMType *t = NULL;
     const char **type_params = NULL;
-    if (strcmp(pk, "base_field_initializer") == 0) {
-        return rust_struct_literal_type_qn(ctx, ts_node_parent(ts_node_parent(parent)));
-    }
     if (strcmp(pk, "field_initializer") == 0) {
         TSNode value = ts_node_child_by_field_name(parent, "value", 5);
         TSNode field = ts_node_child_by_field_name(parent, "field", 5);
@@ -17251,12 +17349,19 @@ static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, owner);
         type_params = rt ? rt->type_param_names : NULL;
         t = rust_lookup_field(ctx, owner, name, 0);
+        if (t && type_params && rust_type_unproven(t, (const char *const *)type_params, 0)) {
+            t = rust_expected_literal_field(ctx, ts_node_parent(ts_node_parent(parent)), owner,
+                                            type_params, t, depth);
+        }
     } else if (strcmp(pk, "arguments") == 0) {
         TSNode call = ts_node_parent(parent);
         if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
             return NULL;
         }
         t = rust_expected_argument_type(ctx, call, expr, parent, &type_params);
+        if (!t) {
+            t = rust_expected_tuple_ctor_field(ctx, call, expr, parent, &type_params);
+        }
     } else if (strcmp(pk, "let_declaration") == 0) {
         TSNode value = ts_node_child_by_field_name(parent, "value", 5);
         TSNode type = ts_node_child_by_field_name(parent, "type", 4);
@@ -17264,9 +17369,98 @@ static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
             return NULL;
         }
         t = rust_parse_type_node(ctx, type);
+    } else if (strcmp(pk, "tuple_expression") == 0) {
+        t = rust_expected_tuple_element(ctx, parent, expr, &type_params, depth);
+    } else if (strcmp(pk, "reference_expression") == 0) {
+        const CBMType *outer = rust_expected_type(ctx, parent, &type_params, depth + 1);
+        t = outer && outer->kind == CBM_TYPE_REFERENCE ? outer->data.reference.elem : NULL;
+    } else if (strcmp(pk, "closure_expression") == 0) {
+        t = rust_expected_closure_value(ctx, parent, expr);
     } else {
         t = rust_expected_return_type(ctx, expr);
     }
+    *type_params_out = type_params;
+    return t;
+}
+
+/* The element at `elem`'s position of the tuple type `tuple`'s position declares. */
+static const CBMType *rust_expected_tuple_element(RustLSPContext *ctx, TSNode tuple, TSNode elem,
+                                                  const char ***type_params, int depth) {
+    const CBMType *outer =
+        rust_expand_type_aliases(ctx, rust_expected_type(ctx, tuple, type_params, depth + 1), 0);
+    if (!outer || outer->kind != CBM_TYPE_TUPLE) {
+        return NULL;
+    }
+    int position = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(tuple); i++) {
+        TSNode child = ts_node_named_child(tuple, i);
+        if (rust_is_comment_node(child)) {
+            continue;
+        }
+        if (ts_node_eq(child, elem)) {
+            return position < outer->data.tuple.count ? outer->data.tuple.elems[position] : NULL;
+        }
+        position++;
+    }
+    return NULL;
+}
+
+/* The value a closure's body produces where the std adapter it is passed to
+ * returns that value: `Entry::or_insert_with(|| v)` (the std entry table's
+ * value type), `Option::unwrap_or_else` / `Option::get_or_insert_with` and
+ * `Result::unwrap_or_else` (the Option's or Result's value type). Only a
+ * receiver that is the std type itself qualifies: a corpus method of the same
+ * name declares its own parameter and is not read here. NULL otherwise. */
+static const CBMType *rust_expected_closure_value(RustLSPContext *ctx, TSNode closure,
+                                                  TSNode body) {
+    TSNode written = ts_node_child_by_field_name(closure, "body", 4);
+    TSNode args = ts_node_parent(closure);
+    TSNode call = ts_node_is_null(args) ? (TSNode){0} : ts_node_parent(args);
+    if (ts_node_is_null(written) || !ts_node_eq(written, body) || ts_node_is_null(call) ||
+        strcmp(ts_node_type(args), "arguments") != 0 ||
+        strcmp(ts_node_type(call), "call_expression") != 0 ||
+        ts_node_named_child_count(args) != 1) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "field_expression") != 0) {
+        return NULL;
+    }
+    TSNode field = ts_node_child_by_field_name(fn, "field", 5);
+    TSNode value = ts_node_child_by_field_name(fn, "value", 5);
+    char *name = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
+    if (!name || ts_node_is_null(value)) {
+        return NULL;
+    }
+    const CBMType *recv = rust_eval_expr_type(ctx, value);
+    const CBMType *produced = NULL;
+    if (strcmp(name, "or_insert_with") == 0) {
+        produced = rust_strip_references(rust_std_entry_return(ctx, recv, name));
+    } else if (strcmp(name, "unwrap_or_else") == 0 || strcmp(name, "get_or_insert_with") == 0) {
+        const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+        const char *head = rust_std_type_head(base);
+        int family = head ? rust_std_family_of(ctx, head) : -1;
+        bool option = family == RUST_STD_OPTION;
+        bool result = family == RUST_STD_RESULT && strcmp(name, "unwrap_or_else") == 0;
+        if ((option || result) && base->kind == CBM_TYPE_TEMPLATE &&
+            base->data.template_type.arg_count >= 1) {
+            produced = base->data.template_type.template_args[0];
+        }
+    }
+    return produced && !cbm_type_is_unknown(produced) ? produced : NULL;
+}
+
+/* Registered QN of the declared type `expr` is expected to have, or NULL. */
+static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
+    TSNode parent = ts_node_parent(expr);
+    if (ts_node_is_null(parent)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(parent), "base_field_initializer") == 0) {
+        return rust_struct_literal_type_qn(ctx, ts_node_parent(ts_node_parent(parent)));
+    }
+    const char **type_params = NULL;
+    const CBMType *t = rust_expected_type(ctx, expr, &type_params, 0);
     t = t ? rust_expand_type_aliases(ctx, t, 0) : NULL;
     const char *qn = NULL;
     if (t && t->kind == CBM_TYPE_NAMED) {

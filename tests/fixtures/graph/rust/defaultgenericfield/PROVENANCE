@@ -1,0 +1,1 @@
+w6-default G042: `Default::default()` for a struct literal field declared through the struct parameter (`filter: F`) reads the argument from the literal type the function returns (`-> Builder<OptOut>`). println! statements print a backtrace (the run is the truth).
