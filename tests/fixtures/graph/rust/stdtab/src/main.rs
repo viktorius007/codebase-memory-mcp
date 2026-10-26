@@ -115,6 +115,8 @@ fn s_let_iter(v: &[Foo]) { let mut it = v.iter(); while let Some(x) = it.next() 
 fn s_mem_take_for(v: &mut Vec<Foo>) { for x in std::mem::take(v) { x.m(); } }
 fn s_mem_take_opt(o: &mut Option<Foo>) { if let Some(x) = std::mem::take(o) { x.m(); } }
 fn s_mem_replace(f: &mut Foo) { std::mem::replace(f, Foo(2)).m(); }
+fn s_get_mut_vec(v: &mut Vec<Foo>) { v.get_mut(0).unwrap().m(); }
+fn s_get_mut_slice(v: &mut [Foo], i: usize) { if let Some(x) = v.get_mut(i) { x.m(); } }
 fn main() {
     let f = Foo(1); let v = vec![Foo(1)]; let mut vm = vec![Foo(1), Foo(2)]; let a = [Foo(1)];
     let mut hm: HashMap<u8, Foo> = HashMap::new(); hm.insert(0, Foo(1));
@@ -139,5 +141,6 @@ fn main() {
     s_opt_ref(Some(&f)); s_tuple(&[(0, Foo(1))]); s_tuple_closure(&[(0, Foo(1))]); s_sort_by(&mut vm); s_retain(&mut vm.clone()); s_drain(&mut vm.clone());
     s_flat_map(&v); s_iter_peek(&v); s_let_iter(&v);
     s_mem_take_for(&mut vec![Foo(1)]); s_mem_take_opt(&mut Some(Foo(1))); s_mem_replace(&mut Foo(1));
+    s_get_mut_vec(&mut vec![Foo(1)]); s_get_mut_slice(&mut [Foo(1)], 0);
     println!("end\n{}", std::backtrace::Backtrace::force_capture());
 }

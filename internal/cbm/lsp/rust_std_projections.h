@@ -14,6 +14,9 @@
  * CBM_STD_ITER_ITEM(iter, item): the `Iterator::Item` of a map or set iterator
  *   type, written over its own type arguments: T the first (K, or a set's T),
  *   E the second (V); `&` shared, `!` mutable borrow; "a,b" a pair.
+ * CBM_STD_SEQ_ELEM(method, ret, source): `v.method(i)` on a Vec or slice whose
+ *   index argument is not a range returns `ret` (rust_std_methods.h syntax,
+ *   T the element).
  * CBM_STD_PRODUCER(module, fn, ret, source, date): rows added to the producer
  *   list rust_std_methods.h documents (same syntax; `~A` is the referent of the
  *   first argument's type). */
@@ -135,4 +138,9 @@ CBM_STD_PRODUCER("mem", "take", "~A", "https://doc.rust-lang.org/std/mem/fn.take
                  "2026-10-26")
 CBM_STD_PRODUCER("mem", "replace", "~A", "https://doc.rust-lang.org/std/mem/fn.replace.html",
                  "2026-10-26")
+#endif
+
+#ifdef CBM_STD_SEQ_ELEM
+CBM_STD_SEQ_ELEM("get_mut", "core.option.Option<!T>",
+                 "https://doc.rust-lang.org/std/primitive.slice.html#method.get_mut")
 #endif

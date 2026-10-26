@@ -5411,6 +5411,43 @@ static const CBMType *rust_std_entry_return(RustLSPContext *ctx, const CBMType *
     return NULL;
 }
 
+typedef struct {
+    const char *method;
+    const char *ret;
+} RustStdSeqElem;
+
+static const RustStdSeqElem RUST_STD_SEQ_ELEMS[] = {
+#define CBM_STD_SEQ_ELEM(method, ret, source) {method, ret},
+#include "rust_std_projections.h"
+#undef CBM_STD_SEQ_ELEM
+    {NULL, NULL}};
+
+/* `v.get_mut(i)` on a Vec or slice, rust_std_projections.h's sequence rows:
+ * the row's return when the index argument is not a range (a range yields
+ * a subslice instead). NULL otherwise. */
+static const CBMType *rust_std_seq_elem_return(RustLSPContext *ctx, const CBMType *recv,
+                                               const char *method, const RustStdCall *call) {
+    const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+    TSNode index = rust_std_call_first_arg(call);
+    if (!base || ts_node_is_null(index) || strcmp(ts_node_type(index), "range_expression") == 0) {
+        return NULL;
+    }
+    if (base->kind == CBM_TYPE_SLICE) {
+        const CBMType *elem = base->data.slice.elem;
+        base = elem ? cbm_type_template(ctx->arena, "alloc.vec.Vec", &elem, 1) : NULL;
+    }
+    const char *head = rust_std_type_head(base);
+    if (!head || rust_std_family_of(ctx, head) != RUST_STD_VEC) {
+        return NULL;
+    }
+    for (const RustStdSeqElem *row = RUST_STD_SEQ_ELEMS; row->method; row++) {
+        if (strcmp(row->method, method) == 0) {
+            return rust_std_return_type(ctx, row->ret, base, call);
+        }
+    }
+    return NULL;
+}
+
 /* `map[&k]` on a map rust_std_projections.h lists: its value type. */
 static const CBMType *rust_std_map_index_output(RustLSPContext *ctx, const CBMType *base) {
     if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 2) {
@@ -6263,6 +6300,9 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
                 if (!declared) {
                     declared = rust_std_entry_return(ctx, recv, mname);
+                }
+                if (!declared) {
+                    declared = rust_std_seq_elem_return(ctx, recv, mname, &call);
                 }
                 if (declared) {
                     return declared;
