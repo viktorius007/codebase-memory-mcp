@@ -1,0 +1,1 @@
+Lane w2-std (2026-10-26): lock guards named through a cfg-selected re-export (bevy_platform::sync shape) deref to the guarded type.

@@ -17,6 +17,11 @@
  * CBM_STD_SEQ_ELEM(method, ret, source): `v.method(i)` on a Vec or slice whose
  *   index argument is not a range returns `ret` (rust_std_methods.h syntax,
  *   T the element).
+ * CBM_STD_GUARD_LEAF(leaf, qn, source): a lock guard type that no corpus type
+ *   claims and whose path the use graph cannot settle (a cfg-selected
+ *   re-export) is read by its last segment as the std guard `qn`, which
+ *   derefs to its first type argument. std, parking_lot, spin and tokio
+ *   guards of these names all deref to the guarded T.
  * CBM_STD_PRODUCER(module, fn, ret, source, date): rows added to the producer
  *   list rust_std_methods.h documents (same syntax; `~A` is the referent of the
  *   first argument's type). */
@@ -145,3 +150,11 @@ CBM_STD_SEQ_ELEM("get_mut", "core.option.Option<!T>",
                  "https://doc.rust-lang.org/std/primitive.slice.html#method.get_mut")
 #endif
 
+#ifdef CBM_STD_GUARD_LEAF
+CBM_STD_GUARD_LEAF("RwLockReadGuard", "std.sync.RwLockReadGuard",
+                   "https://doc.rust-lang.org/std/sync/struct.RwLockReadGuard.html#impl-Deref-for-RwLockReadGuard%3C'_,+T%3E")
+CBM_STD_GUARD_LEAF("RwLockWriteGuard", "std.sync.RwLockWriteGuard",
+                   "https://doc.rust-lang.org/std/sync/struct.RwLockWriteGuard.html#impl-Deref-for-RwLockWriteGuard%3C'_,+T%3E")
+CBM_STD_GUARD_LEAF("MutexGuard", "std.sync.MutexGuard",
+                   "https://doc.rust-lang.org/std/sync/struct.MutexGuard.html#impl-Deref-for-MutexGuard%3C'_,+T%3E")
+#endif

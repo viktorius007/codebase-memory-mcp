@@ -8135,6 +8135,32 @@ static const char *rust_std_wrapper_canonical(const char *qn) {
     return prelude && rust_type_derefs_to_first_arg(prelude) ? prelude : qn;
 }
 
+typedef struct {
+    const char *leaf;
+    const char *qn;
+} RustStdGuardLeaf;
+
+static const RustStdGuardLeaf RUST_STD_GUARD_LEAVES[] = {
+#define CBM_STD_GUARD_LEAF(leaf, qn, source) {leaf, qn},
+#include "rust_std_projections.h"
+#undef CBM_STD_GUARD_LEAF
+    {NULL, NULL}};
+
+/* A lock guard named through a path the use graph does not settle (a
+ * cfg-selected re-export such as `bevy_platform::sync::RwLockWriteGuard`):
+ * no corpus type holds the QN, so its last segment decides, per the
+ * rust_std_projections.h guard rows. NULL for any other name. */
+static const char *rust_std_guard_by_leaf(const char *qn) {
+    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    const char *leaf = dot ? dot + 1 : qn;
+    for (const RustStdGuardLeaf *row = RUST_STD_GUARD_LEAVES; leaf && row->leaf; row++) {
+        if (strcmp(row->leaf, leaf) == 0) {
+            return row->qn;
+        }
+    }
+    return NULL;
+}
+
 /* A template head as written (`Arc`, `std::sync::Arc`, or a name some
  * signature recorded under its defining module) names a std Deref wrapper
  * once it is resolved like any other type name: through the file's `use`
@@ -8152,9 +8178,10 @@ static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head) {
     if (registered) {
         return rust_std_wrapper_canonical(registered);
     }
-    return !strchr(qn, '.') && !rust_resolve_use(ctx, qn)
-               ? rust_std_wrapper_canonical(rust_prelude_in_scope(ctx, qn))
-               : NULL;
+    const char *prelude = !strchr(qn, '.') && !rust_resolve_use(ctx, qn)
+                              ? rust_std_wrapper_canonical(rust_prelude_in_scope(ctx, qn))
+                              : NULL;
+    return prelude ? prelude : rust_std_guard_by_leaf(qn);
 }
 
 static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
