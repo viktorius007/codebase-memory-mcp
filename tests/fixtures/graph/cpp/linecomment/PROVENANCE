@@ -1,10 +1,10 @@
 Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
 defects, C/C++: `#line` after same-line comment not blanked,
 preprocessor.cpp). The compiler honours both directives: the program prints
-"answer at 951" and exits 0. `answer` is defined only by the expansion of
-DEFINE_GETTER and main calls it only through CALL, so both come from the
-preprocessed pass (cbm_preprocess_with_map, then the line map). The graph must
-report the definition answer at main.c:13, main at main.c:16 and the call
-main -> answer at main.c:18. Without the fix the expansion keeps
-`#line 900 "gen.y"` / `#line 950 "gen.y"`, and build_line_map places answer
-and the call in gen.y (lines 900 and 952), outside main.c.
+"main at 951" and exits 0. main calls answer only through the object-like
+macro ASK, so that call comes from the preprocessed pass
+(cbm_preprocess_with_map, then the line map). Expected graph: the call
+main -> answer at main.c:19 (answer at main.c:10, main at main.c:17, both
+also from the raw pass). Without the fix the expansion keeps
+`#line 950 "gen.y"`, the call maps to gen.y:952, and the main-file check
+rejects it: no main -> answer edge.
