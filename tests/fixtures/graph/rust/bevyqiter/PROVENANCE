@@ -1,0 +1,1 @@
+Query-item lane w3-query, iteration family: bindings produced by `for .. in query.iter() / &query / &mut query / query.iter_mut()`, by closure parameters of QueryIter adaptors and by tuple patterns over a bevy-shaped `Query<D, F>` (crate bevy_ecs laid out as bevy lays it out). println! statements print a backtrace (the run is the truth).
