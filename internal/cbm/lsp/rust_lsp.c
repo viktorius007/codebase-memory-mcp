@@ -14491,6 +14491,7 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
         const char *quals; /* space-separated crate paths; "" alone = unqualified only */
         RustMacroArgForm form;
         bool check_import;
+        bool import_only; /* unqualified only when a `use` names one of `quals` */
     } table[] = {
         /* std::fmt defines positional expressions and `name = expression`:
          * https://doc.rust-lang.org/std/fmt/#named-parameters
@@ -14554,6 +14555,21 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
         {"execute", "crossterm", RUST_MACRO_ARGS_EXPR_LIST},
         {"line", "ratatui ratatui_macros", RUST_MACRO_ARGS_ARRAY_BODY},
         {"text", "ratatui ratatui_macros", RUST_MACRO_ARGS_ARRAY_BODY},
+        /* approx: `lhs, rhs [, name = expression]*`
+         * https://docs.rs/approx/latest/approx/#macros
+         * No prelude defines these names, so a bare one needs its `use`. */
+        {"assert_abs_diff_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_abs_diff_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_relative_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_relative_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_ulps_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"assert_ulps_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"abs_diff_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"abs_diff_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"relative_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"relative_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"ulps_eq", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
+        {"ulps_ne", "approx", RUST_MACRO_ARGS_EXPR_LIST, true, true},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strcmp(leaf, table[i].leaf) != 0)
@@ -14566,6 +14582,8 @@ static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
             if (imported)
                 return strstr(imported, "::") &&
                        rust_builtin_macro_arg_form(ctx, imported, form);
+            if (table[i].import_only)
+                return false;
             *form = table[i].form;
             return true;
         }
