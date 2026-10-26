@@ -1,0 +1,1 @@
+Receiver-typing lane w2-recv, class B3: a field whose declared type is the struct's own type parameter, read through the impl's bare self, takes the impl's parameter at that position (renamed, after a lifetime) and dispatches through its bound. println! statements print a backtrace (the run is the truth).

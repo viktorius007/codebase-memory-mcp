@@ -7246,6 +7246,46 @@ static const CBMType *rust_eval_member_access_deref(RustLSPContext *ctx, const C
     return rust_eval_member_access_at(ctx, next, member, method_call, hop + 1, out_method);
 }
 
+/* A field read through the enclosing impl's bare `self` (`self.preimage`
+ * in `impl<C: Curve> Tr for Map<C>`): the struct's parameter at a position
+ * the impl fills with one of its own parameter names becomes that type
+ * parameter, so the impl's bounds dispatch a method on it. `self_qn` is the
+ * receiver as typed, `type_qn` its registered owner, `ft` the declared type. */
+static const CBMType *rust_self_field_param_type(RustLSPContext *ctx, const char *self_qn,
+                                                 const char *type_qn, const CBMType *ft) {
+    if (!ctx->self_param_names || !ctx->self_type_qn || !self_qn ||
+        strcmp(self_qn, ctx->self_type_qn) != 0)
+        return ft;
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!rt || rt->alias_of || !rt->type_param_names)
+        return ft;
+    /* Only a field that is the parameter itself (`c: C`, `c: &'a C`): inside
+     * a compound type (`iter: Iter<'a, M>`) the written argument already
+     * selects the impl, and a bare parameter there would demand a proof of
+     * the impl's bounds that the parameter's own bounds do not give. */
+    const CBMType *inner = ft;
+    while (inner && inner->kind == CBM_TYPE_REFERENCE)
+        inner = inner->data.reference.elem;
+    int declared = 0;
+    while (rt->type_param_names[declared])
+        declared++;
+    if (!inner || rust_receiver_param_index(ctx, inner, rt->type_param_names, declared) < 0)
+        return ft;
+    int count = 0;
+    while (ctx->self_param_names[count])
+        count++;
+    const CBMType **args =
+        (const CBMType **)cbm_arena_alloc(ctx->arena, (size_t)(count + 1) * sizeof(*args));
+    if (!args)
+        return ft;
+    for (int i = 0; i < count; i++) {
+        const char *name = ctx->self_param_names[i];
+        args[i] = name[0] ? cbm_type_type_param(ctx->arena, name) : cbm_type_unknown();
+    }
+    args[count] = NULL;
+    return rust_subst_receiver_args(ctx, ft, rt->type_param_names, args, count, NULL, 0);
+}
+
 static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
                                                  const char *member, bool method_call, int hop,
                                                  const CBMRegisteredFunc **out_method) {
@@ -7339,6 +7379,8 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
             return rust_subst_receiver_args(ctx, ft, rt->type_param_names, template_args,
                                             template_count, NULL, 0);
         }
+        if (!template_args && base->kind == CBM_TYPE_NAMED)
+            return rust_self_field_param_type(ctx, base->data.named.qualified_name, type_qn, ft);
         return ft;
     }
     return rust_eval_member_access_deref(ctx, base, member, method_call, hop, out_method);
@@ -17903,10 +17945,13 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     const char *saved_self = ctx->self_type_qn;
     const CBMType *saved_self_value = ctx->self_value_type;
+    const char **saved_self_params = ctx->self_param_names;
     const char *saved_trait = ctx->self_trait_qn;
     const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
     ctx->self_type_qn = effective_recv;
+    ctx->self_param_names =
+        is_blanket ? NULL : rust_impl_self_param_names(ctx->arena, type_text, effective_recv);
     ctx->self_value_type = strcmp(ts_node_type(type_node), "reference_type") == 0
                                ? rust_parse_type_node(ctx, type_node)
                                : NULL;
@@ -17951,6 +17996,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     ctx->type_param_bound_count = saved_bound_count;
     ctx->self_type_qn = saved_self;
     ctx->self_value_type = saved_self_value;
+    ctx->self_param_names = saved_self_params;
     ctx->self_trait_qn = saved_trait;
     ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;

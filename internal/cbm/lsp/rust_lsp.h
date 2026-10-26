@@ -167,6 +167,10 @@ typedef struct {
      * implementations over the trait method when only one impl exists. */
     const char *self_type_qn;
     const CBMType *self_value_type; /* actual Self shape for a reference impl */
+    /* The impl's self-type arguments by position (`impl<C> Tr for Map<C>`
+     * gives {"C"}); "" where the argument is not a bare name. NULL outside
+     * a non-blanket impl or when the self type has no arguments. */
+    const char **self_param_names;
     const char *self_trait_qn;
     const char *self_trait_spelling; /* raw `impl <Trait> for` text, NULL outside trait impls */
 
