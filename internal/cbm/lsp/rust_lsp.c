@@ -16358,7 +16358,8 @@ static bool rust_type_has_open_arg(RustLSPContext *ctx, const CBMType *t) {
  * cannot prove the impl's bounds. When `H` has no inherent `m` and no Deref
  * target, `m` is no std-trait name, exactly one in-scope corpus trait
  * declares `m`, and exactly one impl of that trait on `H` defines it, that
- * impl is the only candidate a compiling call can reach. Assumes a nominal
+ * impl is the only candidate a compiling call can reach. A blanket or
+ * reference impl of the trait defining `m` withholds. Assumes a nominal
  * impl on the head is chosen over the trait's blanket impls. */
 static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *ctx,
                                                                const CBMType *base,
@@ -16374,8 +16375,17 @@ static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *c
     if (!head_type || head_type->is_interface)
         return NULL;
     const CBMRegisteredFunc *declaration = rust_sole_in_scope_trait_declaration(ctx, method);
-    if (!declaration || !declaration->receiver_type)
+    if (!declaration || !declaration->receiver_type ||
+        rust_trait_method_overridden_open(ctx, declaration->receiver_type, method))
         return NULL;
+    /* An impl on `&W`/`&mut W` defining `m` competes at the autoref steps. */
+    CBMMethodIter references;
+    cbm_registry_methods_chain(ctx->registry, "core.reference", method, &references);
+    for (int ri; (ri = cbm_method_iter_next(&references)) >= 0;) {
+        const CBMRegisteredFunc *f = &references.reg->funcs[ri];
+        if (!f->impl_trait_qn || rust_trait_qn_same(f->impl_trait_qn, declaration->receiver_type))
+            return NULL;
+    }
     const CBMRegisteredFunc *selected = NULL;
     CBMMethodIter methods;
     cbm_registry_methods_chain(ctx->registry, head, method, &methods);
