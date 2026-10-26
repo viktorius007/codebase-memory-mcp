@@ -144,3 +144,4 @@ CBM_STD_PRODUCER("mem", "replace", "~A", "https://doc.rust-lang.org/std/mem/fn.r
 CBM_STD_SEQ_ELEM("get_mut", "core.option.Option<!T>",
                  "https://doc.rust-lang.org/std/primitive.slice.html#method.get_mut")
 #endif
+
