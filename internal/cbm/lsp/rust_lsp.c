@@ -11121,32 +11121,29 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
     char *head = cbm_arena_strndup(ctx->arena, raw, (size_t)(sep - raw));
     bool relative =
         strcmp(head, "crate") == 0 || strcmp(head, "self") == 0 || strcmp(head, "super") == 0;
-    const CBMCargoMember *member =
-        !relative && ctx->cargo_manifest
-            ? cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head)
-            : NULL;
-    /* Without a workspace member entry, the crate graph's extern prelude
-     * names the library (a globbed `members = ["crates/*"]`). */
+    /* Another crate is addressable only through the invoking crate's extern
+     * prelude, whose keys are its dependency names (renamed ones included):
+     * the crate graph decides the head, never a workspace member's name. */
     const char *extern_root =
-        !relative && !member && ctx->imports->modtree
+        !relative && ctx->imports->modtree
             ? cbm_rust_modtree_extern_root(ctx->imports->modtree, ctx->module_qn, head)
             : NULL;
-    if (!relative && !member && !extern_root)
-        return NULL; /* an external crate's macro: its source is not the corpus */
-    const char *item = relative ? resolved
-                       : member ? rust_resolve_path_in_module(ctx, ctx->module_qn, raw, NULL)
-                       : strstr(sep + 2, "::")
-                           ? NULL
-                           : cbm_arena_sprintf(ctx->arena, "%s.%s", extern_root, sep + 2);
+    if (!relative && !extern_root)
+        return NULL; /* outside the corpus, or not a dependency of this crate */
+    const char *extern_dir = extern_root ? module_parent_qn(ctx, extern_root) : NULL;
+    const char *item = relative                ? resolved
+                       : !strstr(sep + 2, "::") ? cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                                    extern_root, sep + 2)
+                       : extern_dir             ? cbm_arena_sprintf(ctx->arena, "%s.%s", extern_dir,
+                                                        convert_path_to_qn(ctx->arena, sep + 2))
+                                                : NULL;
     const char *dot = item ? strrchr(item, '.') : NULL;
     if (!dot || strcmp(dot + 1, name) != 0)
         return NULL;
     const char *module = cbm_arena_strndup(ctx->arena, item, (size_t)(dot - item));
     const char *exported = NULL;
-    if (strcmp(sep + 2, name) == 0 && (member || extern_root || strcmp(head, "crate") == 0)) {
-        const char *prefix = member        ? rust_member_root_prefix(ctx, member)
-                             : extern_root ? module_parent_qn(ctx, extern_root)
-                                           : rust_crate_root_prefix(ctx);
+    if (strcmp(sep + 2, name) == 0 && (extern_dir || strcmp(head, "crate") == 0)) {
+        const char *prefix = extern_dir ? extern_dir : rust_crate_root_prefix(ctx);
         exported = prefix ? rust_exported_macro_text(ctx->imports->macros, prefix, name) : NULL;
     }
     const char *reexported = NULL;
