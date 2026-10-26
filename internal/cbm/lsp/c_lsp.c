@@ -1898,43 +1898,80 @@ static const CLambdaCapture *c_lambda_capture_types(CLSPContext *ctx, TSNode lis
     return found;
 }
 
-/* True when expr names a binding of frame whose type is unknown. Such a name
- * shadows every outer name of the same spelling, so evaluating it through the
- * outer scope or the registry would type it as something it is not. */
-static bool c_expr_names_unknown_local(CLSPContext *ctx, const CBMScope *frame, TSNode expr) {
-    if (ts_node_is_null(expr))
-        return false;
-    if (strcmp(ts_node_type(expr), "identifier") == 0) {
-        char *name = c_node_text(ctx, expr);
-        const CBMVarBinding *b = name ? cbm_scope_lookup_local(frame, name) : NULL;
-        return b && cbm_type_is_unknown(b->type);
+/* The frame of the lambda whose return operand is being typed, NULL outside
+ * that typing. A name this frame binds to an unknown type (an `auto`
+ * parameter of a generic lambda) evaluates to unknown: it hides every outer
+ * name of the same spelling, so neither the enclosing scope nor the registry
+ * may type it. Thread-local because files are resolved in parallel. */
+static _Thread_local const CBMScope *c_lambda_infer_frame;
+
+/* The identifier a declarator declares, or a null node (an abstract
+ * declarator, an operator name). */
+static TSNode c_declarator_identifier(TSNode decl) {
+    for (int depth = 0; depth < 16 && !ts_node_is_null(decl); depth++) {
+        if (strcmp(ts_node_type(decl), "identifier") == 0)
+            return decl;
+        TSNode inner = ts_node_child_by_field_name(decl, "declarator", 10);
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0)
+            inner = ts_node_named_child(decl, ts_node_named_child_count(decl) - 1);
+        decl = inner;
     }
-    uint32_t nc = ts_node_named_child_count(expr);
-    for (uint32_t i = 0; i < nc; i++) {
-        if (c_expr_names_unknown_local(ctx, frame, ts_node_named_child(expr, i)))
-            return true;
-    }
-    return false;
+    return (TSNode){0};
 }
 
-/* Bind, in the current (lambda) frame, the lambda's parameters and the body's
- * declarations before the body statement stop. */
+/* Bind decl's identifier in the current frame to the unknown type unless the
+ * frame binds it already: a declarator shape the statement processor does
+ * not type still hides the outer name. */
+static void c_lambda_bind_unknown(CLSPContext *ctx, TSNode decl) {
+    TSNode id = c_declarator_identifier(decl);
+    char *name = ts_node_is_null(id) ? NULL : c_node_text(ctx, id);
+    if (name && !cbm_scope_lookup_local(ctx->current_scope, name))
+        cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+}
+
+/* Bind one parameter of a lambda in the current frame. A defaulted parameter
+ * is typed like a plain one: the default does not change its type. */
+static void c_lambda_bind_param(CLSPContext *ctx, TSNode param) {
+    const char *pk = ts_node_type(param);
+    if (strcmp(pk, "parameter_declaration") != 0 &&
+        strcmp(pk, "optional_parameter_declaration") != 0) {
+        /* variadic_parameter_declaration and other shapes: name only */
+        c_lambda_bind_unknown(ctx, ts_node_child_by_field_name(param, "declarator", 10));
+        return;
+    }
+    TSNode type_node = ts_node_child_by_field_name(param, "type", 4);
+    TSNode decl = ts_node_child_by_field_name(param, "declarator", 10);
+    if (!ts_node_is_null(type_node) && !ts_node_is_null(decl) &&
+        strcmp(ts_node_type(decl), "identifier") == 0) {
+        char *name = c_node_text(ctx, decl);
+        if (name)
+            cbm_scope_bind(ctx->current_scope, name, c_parse_type_node(ctx, type_node));
+    } else if (strcmp(pk, "parameter_declaration") == 0) {
+        c_process_statement(ctx, param);
+    }
+    c_lambda_bind_unknown(ctx, decl);
+}
+
+/* Bind, in the current (lambda) frame, the lambda's parameters and the
+ * declarations of the body before the body statement stop. */
 static void c_lambda_bind_names(CLSPContext *ctx, TSNode declarator, TSNode body, uint32_t stop) {
     TSNode params = ts_node_is_null(declarator)
                         ? declarator
                         : ts_node_child_by_field_name(declarator, "parameters", 10);
     uint32_t pnc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
-    for (uint32_t i = 0; i < pnc; i++) {
-        TSNode param = ts_node_named_child(params, i);
-        const char *pk = ts_node_type(param);
-        if (strcmp(pk, "parameter_declaration") == 0 ||
-            strcmp(pk, "optional_parameter_declaration") == 0)
-            c_process_statement(ctx, param);
-    }
+    for (uint32_t i = 0; i < pnc; i++)
+        c_lambda_bind_param(ctx, ts_node_named_child(params, i));
     for (uint32_t i = 0; i < stop; i++) {
         TSNode stmt = ts_node_named_child(body, i);
-        if (strcmp(ts_node_type(stmt), "declaration") == 0)
-            c_process_statement(ctx, stmt);
+        if (strcmp(ts_node_type(stmt), "declaration") != 0)
+            continue;
+        c_process_statement(ctx, stmt);
+        uint32_t nc = ts_node_named_child_count(stmt);
+        for (uint32_t ci = 0; ci < nc; ci++) {
+            const char *field = ts_node_field_name_for_named_child(stmt, ci);
+            if (field && strcmp(field, "declarator") == 0)
+                c_lambda_bind_unknown(ctx, ts_node_named_child(stmt, ci));
+        }
     }
 }
 
@@ -1967,9 +2004,10 @@ static const CBMType *c_lambda_body_return_type(CLSPContext *ctx, TSNode node,
     for (uint32_t i = 0; i < capture_count; i++)
         cbm_scope_bind(ctx->current_scope, captures[i].name, captures[i].type);
     c_lambda_bind_names(ctx, declarator, body, ri);
-    const CBMType *ret = c_expr_names_unknown_local(ctx, ctx->current_scope, ret_expr)
-                             ? NULL
-                             : c_eval_expr_type(ctx, ret_expr);
+    const CBMScope *saved_frame = c_lambda_infer_frame;
+    c_lambda_infer_frame = ctx->current_scope;
+    const CBMType *ret = c_eval_expr_type(ctx, ret_expr);
+    c_lambda_infer_frame = saved_frame;
     ctx->current_scope = saved_scope;
     ctx->fp_count = saved_fp_count;
     return ret;
@@ -1985,8 +2023,12 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
             return cbm_type_unknown();
 
         // Scope lookup
-        const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
+        const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+        const CBMType *t = binding ? binding->type : cbm_type_unknown();
         if (!cbm_type_is_unknown(t))
+            return t;
+        if (binding && c_lambda_infer_frame &&
+            binding == cbm_scope_lookup_local(c_lambda_infer_frame, name))
             return t;
 
         // Check if it's a registered function (before type check — functions

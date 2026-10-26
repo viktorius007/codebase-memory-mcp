@@ -27,6 +27,10 @@ int main() {
     by_capture().run(); // Inner::run
     auto generic = [](auto w) { return w; };
     generic(Inner{}).run(); // Inner::run (resolver: unknown, no link)
+    auto defaulted = [](Inner w = Inner{}) { return w; };
+    defaulted().run(); // Inner::run
+    auto discarded = [](auto w) { return (static_cast<void>(w), Inner{}); };
+    discarded(0).run(); // Inner::run (the comma's right operand decides)
     w.run();               // Outer::run
     v.run();               // Outer::run
     c.run();               // Outer::run
