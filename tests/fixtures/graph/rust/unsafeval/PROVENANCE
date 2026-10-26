@@ -1,0 +1,1 @@
+w4-bind G011: a let bound to an `unsafe { .. }` block takes the type of the block tail. println! statements print a backtrace (the run is the truth).

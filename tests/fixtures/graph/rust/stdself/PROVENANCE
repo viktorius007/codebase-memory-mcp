@@ -1,0 +1,1 @@
+w4-bind G002: in an impl on a std generic type (`impl Tr for Vec<Dep>`, `impl<T: Tr> Tr for Option<T>`) `self` keeps its written arguments, so a for or if-let pattern over it binds the element. println! statements print a backtrace (the run is the truth).

@@ -1,0 +1,1 @@
+w4-bind G002: a closure written as the value of a function-pointer struct field takes its parameter types from the field type. println! statements print a backtrace (the run is the truth).

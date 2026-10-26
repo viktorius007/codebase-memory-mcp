@@ -1,0 +1,1 @@
+w4-bind G014/G017: a tuple struct position (`self.0`, `res.1`, through a Deref wrapper) is typed from the struct declaration. println! statements print a backtrace (the run is the truth).
