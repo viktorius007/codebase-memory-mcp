@@ -1,0 +1,1 @@
+Written for lane w2-macro: a macro_rules! transcriber that assembles a method call from captured `$receiver:ident` and `$method:ident` fragments (pm replay_contract invoke!); callees print their backtrace (the run is the truth).

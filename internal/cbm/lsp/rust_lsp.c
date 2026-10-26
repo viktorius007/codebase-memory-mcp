@@ -17378,7 +17378,9 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
             callee = inner;
         }
     }
+    TSNode receiver = {0};
     if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "field_expression") == 0) {
+        receiver = ts_node_child_by_field_name(callee, "value", 5);
         callee = ts_node_child_by_field_name(callee, "field", 5);
     } else if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "scoped_identifier") == 0) {
         callee = ts_node_child_by_field_name(callee, "name", 4);
@@ -17388,6 +17390,18 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
                               &mapped_start, &mapped_end)) {
         ctx->emit_callee_start_byte = mapped_start;
         ctx->emit_callee_end_byte = mapped_end;
+        /* A transcriber that assembles `$receiver.$method(..)` from captured
+         * fragments: the receiver and the method name are call-site tokens,
+         * so the call is the call site's, at the method name. */
+        uint32_t receiver_start = 0;
+        uint32_t receiver_end = 0;
+        if (ctx->emit_site_end_byte == 0 && !ts_node_is_null(receiver) &&
+            rust_map_source_range(ctx, ts_node_start_byte(receiver), ts_node_end_byte(receiver),
+                                  &receiver_start, &receiver_end) &&
+            receiver_end <= mapped_start) {
+            ctx->emit_site_start_byte = receiver_start;
+            ctx->emit_site_end_byte = mapped_end;
+        }
     }
     rust_resolve_call_expression_inner(ctx, node);
     ctx->emit_site_start_byte = saved_start;
