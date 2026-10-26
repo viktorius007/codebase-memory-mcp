@@ -2494,6 +2494,31 @@ static bool pxc_python_binder_fits(const cbm_gbuf_node_t *node, const CBMPyNames
     return node && (!label || (node->label && strcmp(node->label, label) == 0));
 }
 
+/* Whether something other than `owner`'s own binding can answer `member`
+ * when its run leaves the name unbound: a module-level `__getattr__` (PEP
+ * 562), or, for a package `__init__`, a submodule `member` the import system
+ * loads for `from <package> import <member>`. */
+static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
+                                            const cbm_gbuf_node_t *owner,
+                                            const CBMPyNamespaceFacts *facts, const char *member) {
+    for (int i = 0; i < facts->count; i++) {
+        const char *name = facts->items[i].local_name;
+        if (name && (strcmp(name, "__getattr__") == 0 || strcmp(name, CBM_PY_NS_ANY_NAME) == 0))
+            return true;
+    }
+    const char *path = owner->file_path;
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    const char *base = slash ? slash + 1 : path;
+    if (!base || strcmp(base, "__init__.py") != 0)
+        return false;
+    char dir[CBM_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - path) : 0, path);
+    if (n < 0 || (size_t)n >= sizeof(dir))
+        return true;
+    const cbm_gbuf_node_t *node = NULL;
+    return pxc_python_find_in(ctx, dir, member, &node) != PXC_PY_FINDS_NOTHING;
+}
+
 /* The binding `owner`'s top-level run leaves on `member`: the last statement
  * that binds it decides. A star import binds it only when the starred module
  * exports it; `del` leaves it unbound. A statement the facts do not model
@@ -2508,7 +2533,10 @@ static bool pxc_python_binder_fits(const cbm_gbuf_node_t *node, const CBMPyNames
  * that node when the node is what the statement binds (pxc_python_binder_fits)
  * and every statement before it leaves the name unbound or binds that same
  * node: the node is then the only binding the run can leave. Any other
- * earlier binder may survive it, so the name is opaque. */
+ * earlier binder may survive it, so the name is opaque; so is a name every
+ * earlier statement leaves unbound when a submodule or module `__getattr__`
+ * answers it whenever the statement does not run
+ * (pxc_python_unbound_has_fallback). */
 static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
                                                  const cbm_gbuf_node_t *owner,
                                                  const CBMPyNamespaceFacts *facts,
@@ -2550,8 +2578,13 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
     }
     pxc_free_fqn(file_qn);
     if (kept) {
-        bool only_own = verdict == PXC_PY_UNBOUND || (verdict == PXC_PY_BOUND && *out == own);
-        verdict = only_own && fits && own ? PXC_PY_BOUND : PXC_PY_OPAQUE;
+        bool unbound = verdict == PXC_PY_UNBOUND;
+        bool only_own = unbound || (verdict == PXC_PY_BOUND && *out == own);
+        verdict =
+            only_own && fits && own &&
+                    !(unbound && pxc_python_unbound_has_fallback(pr->ctx, owner, facts, member))
+                ? PXC_PY_BOUND
+                : PXC_PY_OPAQUE;
         *out = own;
     }
     if (verdict != PXC_PY_BOUND)
