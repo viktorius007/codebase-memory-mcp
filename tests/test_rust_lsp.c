@@ -1553,6 +1553,64 @@ static int crossfile_derived_default_resolves(const char **decorators) {
     return found;
 }
 
+/* A one-field type in another file whose attributes derive `Deref` (the
+ * corpus derive, bevy_derive's) derefs to its field, so a method of the field's
+ * type resolves on the wrapper. The derive is read from a `derive(..)` list
+ * only, at any position and through a path; a doc string quoting one is not a
+ * derive. Returns the call's index, -1 when it stays unresolved. */
+static int crossfile_derived_deref_resolves_with(const char *attribute, const char *param,
+                                                 const char *field) {
+    const char *caller = param ? "fn run(w: demo::Wrapper<u8>) { w.work(); }\n"
+                               : "fn run(w: demo::Wrapper) { w.work(); }\n";
+    const char *params[] = {param, NULL};
+    const char *decorators[] = {attribute, NULL};
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.demo.Wrapper";
+    defs[0].short_name = "Wrapper";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.demo";
+    defs[0].decorators = decorators;
+    defs[0].field_defs = field;
+    defs[0].signature_param_types = param ? params : NULL;
+    defs[0].signature_param_count = param ? 1 : 0;
+    defs[1].qualified_name = "test.demo.Inner";
+    defs[1].short_name = "Inner";
+    defs[1].label = "Struct";
+    defs[1].def_module_qn = "test.demo";
+    defs[2].qualified_name = "test.demo.Inner.work";
+    defs[2].short_name = "work";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "test.demo.Inner";
+    defs[2].def_module_qn = "test.demo";
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 3, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int found = find_confident(&out, "run", "Inner.work");
+    cbm_arena_destroy(&a);
+    return found;
+}
+
+static int crossfile_derived_deref_resolves(const char *attribute) {
+    return crossfile_derived_deref_resolves_with(attribute, NULL, "0:Inner");
+}
+
+TEST(rustlsp_crossfile_derived_deref_reaches_field) {
+    /* A generic newtype's field is read against its own parameter. */
+    ASSERT_GTE(crossfile_derived_deref_resolves_with("#[derive(Deref)]", "T", "0:Inner"), 0);
+    ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Deref)]"), 0);
+    ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Component, Deref, DerefMut)]"), 0);
+    ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Clone, bevy::prelude::Deref)]"), 0);
+    ASSERT_EQ(-1, crossfile_derived_deref_resolves("#[derive(Component, DerefMut)]"));
+    ASSERT_EQ(-1, crossfile_derived_deref_resolves("#[doc = \"derive(Deref)\"]"));
+    PASS();
+}
+
 TEST(rustlsp_crossfile_derived_default_types_value) {
     const char *derived[] = {"#[derive(Debug, Default)]", NULL};
     ASSERT_GTE(crossfile_derived_default_resolves(derived), 0);
@@ -14599,6 +14657,7 @@ void suite_rust_lsp(void) {
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_crossfile_derived_default_types_value);
+    RUN_TEST(rustlsp_crossfile_derived_deref_reaches_field);
     RUN_TEST(rustlsp_crossfile_trait_provided_constructor_types_value);
     RUN_TEST(rustlsp_crossfile_await_async_result_then_expect_and_try);
     RUN_TEST(rustlsp_crossfile_await_non_async_peels_future_output);
