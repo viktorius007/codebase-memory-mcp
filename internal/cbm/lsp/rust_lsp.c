@@ -7784,9 +7784,11 @@ static const CBMType *rust_user_deref_target(RustLSPContext *ctx, const char *qn
     if (!rt || !rt->deref_target || cbm_type_is_unknown(rt->deref_target)) {
         return NULL;
     }
+    /* A target written as a type alias (`type Target = DiGraph<N, S>;`) is
+     * the type the alias stands for, as for any other use of the alias. */
     const CBMType *target = rt->deref_target;
     if (!rt->deref_param_names || argc <= 0) {
-        return target;
+        return rust_expand_type_aliases(ctx, target, 0);
     }
     int params = 0;
     while (rt->deref_param_names[params]) {
@@ -7804,7 +7806,8 @@ static const CBMType *rust_user_deref_target(RustLSPContext *ctx, const char *qn
     }
     names[n] = NULL;
     subst[n] = NULL;
-    return rust_substitute_type(ctx->arena, target, names, subst);
+    return rust_expand_type_aliases(ctx, rust_substitute_type(ctx->arena, target, names, subst),
+                                    0);
 }
 
 /* Returns the inner type after one Deref step: the first template arg of
