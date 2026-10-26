@@ -720,8 +720,9 @@ static bool py_ns_rebinds(PyNamespaceBuilder *b, int start, const char *name, Py
 }
 
 /* Whether the identifier `node` is a name its statement binds in the module
- * namespace: an assignment, augmented-assignment, `for`, `as` or walrus
- * target, possibly unpacked, a `del` target, or the name a `type` statement
+ * namespace: an assignment (one with a value; an annotation alone binds
+ * nothing), augmented-assignment, `for`, `as` or walrus target, possibly
+ * unpacked, a `del` target, or the name a `type` statement
  * declares. A comprehension's own `for` target is local to the comprehension. */
 static bool py_ns_binding_identifier(TSNode node) {
     if (cbm_python_type_alias_name(node))
@@ -746,6 +747,9 @@ static bool py_ns_binding_identifier(TSNode node) {
     }
     const char *kind = ts_node_type(parent);
     const char *field = NULL;
+    if (strcmp(kind, "assignment") == 0 &&
+        ts_node_is_null(ts_node_child_by_field_name(parent, TS_FIELD("right"))))
+        return false; /* `x: int` annotates x and binds nothing */
     if (strcmp(kind, "assignment") == 0 || strcmp(kind, "augmented_assignment") == 0 ||
         strcmp(kind, "for_statement") == 0)
         field = "left";
