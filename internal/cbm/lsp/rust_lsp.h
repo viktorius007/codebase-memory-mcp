@@ -468,11 +468,14 @@ void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
                               CBMRustMacroFacts *facts);
 void cbm_rust_macro_table_free(CBMRustMacroTable *table);
 
-/* One `impl Deref for <receiver> { type Target = <target>; }` that a file-level
- * invocation of a corpus macro_rules! emits; spellings as the expansion reads. */
+/* What a file-level invocation of a corpus macro_rules! declares on the impl
+ * self type `receiver` (spelling as the expansion reads): the `target` of an
+ * `impl Deref` naming core::ops::Deref, or (target NULL) the name `method` of
+ * a method another emitted impl gives the type. */
 typedef struct {
     const char *receiver;
     const char *target;
+    const char *method;
 } CBMRustMacroDeref;
 typedef struct {
     CBMRustMacroDeref *items;
@@ -484,9 +487,11 @@ typedef struct {
  * (an invocation of a name defined twice could reach either). Arena-owned;
  * NULL when there are none. */
 const char **cbm_rust_deref_macro_names(CBMArena *arena, const CBMRustMacroTable *table);
-/* Append to `out` the Deref impls emitted by the file-level, non-cfg-gated
- * invocations in `source` of the macros `names`, expanded through the first
- * matching arm of their one corpus definition. Arena-owned strings. */
+/* When `source` invokes one of `names`: append to `out` what its file-level,
+ * non-cfg-gated invocations of corpus macro_rules! emit, each expanded through
+ * the first matching arm of the one corpus definition of its name. An
+ * invocation whose name a file-level `use` may bind outside the corpus is
+ * skipped. Arena-owned strings. */
 void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
                                 const char **names, const char *source, int len,
                                 CBMRustMacroDerefArray *out);

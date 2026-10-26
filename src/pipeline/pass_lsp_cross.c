@@ -1357,22 +1357,39 @@ static CBMRustMacroDerefArray *pxc_rust_macro_derefs(const cbm_pipeline_ctx_t *c
     return per_file;
 }
 
-/* Append the macro-emitted Deref impls of one file as impl relations on the
- * types its own module declares. */
+/* Append what one file's corpus macro invocations declare on the types its
+ * own module names: each Deref as an impl relation, as a written
+ * `impl Deref` there would be, and each other emitted method as an inherent
+ * method of the type. The method has no graph node, so a call it answers
+ * publishes nothing, but it is no longer read through the Deref target. */
 static int pxc_append_rust_macro_derefs(CBMArena *arena, const CBMRustMacroDerefArray *derefs,
                                         const char *project_name, const char *rel_path,
                                         const char *module_qn, CBMLSPDef *dst) {
     int added = 0;
     for (int i = 0; derefs && module_qn && i < derefs->count; i++) {
-        const char *owner = cbm_rust_impl_owner_name(arena, derefs->items[i].receiver);
-        if (!owner || !owner[0]) {
+        const CBMRustMacroDeref *entry = &derefs->items[i];
+        const char *owner = cbm_rust_impl_owner_name(arena, entry->receiver);
+        if (!owner || !owner[0] || strchr(owner, ':')) {
+            continue;
+        }
+        const char *owner_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, owner);
+        if (entry->method) {
+            CBMLSPDef *def = &dst[added++];
+            memset(def, 0, sizeof(*def));
+            def->qualified_name = cbm_arena_sprintf(arena, "%s.%s", owner_qn, entry->method);
+            def->short_name = entry->method;
+            def->label = "Method";
+            def->receiver_type = owner_qn;
+            def->receiver_spelling = entry->receiver;
+            def->def_module_qn = module_qn;
+            def->lang = CBM_LANG_RUST;
             continue;
         }
         CBMImplTrait impl = {
-            .trait_name = "Deref",
-            .struct_name = derefs->items[i].receiver,
-            .struct_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, owner),
-            .target_type = derefs->items[i].target,
+            .trait_name = "core::ops::Deref",
+            .struct_name = entry->receiver,
+            .struct_qn = owner_qn,
+            .target_type = entry->target,
         };
         if (pxc_build_rust_impl_relation(arena, &impl, project_name, rel_path, module_qn,
                                          &dst[added]) == 0) {

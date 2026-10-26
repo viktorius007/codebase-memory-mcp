@@ -352,24 +352,6 @@ static bool rust_is_wrapper_trait_method(const char *method_name) {
     return rust_method_in(RUST_WRAPPER_TRAIT_METHODS, method_name);
 }
 
-/* Prelude trait names whose method short-names we treat as universally
- * available (for emit-on-best-effort when we cannot pin down the trait
- * impl). Borrowed from `core::prelude::v1`. */
-static bool is_prelude_trait_method(const char *method_name) {
-    static const char *const iterator_future[] = {
-        /* Iterator (most-used subset) */
-        "next", "iter", "iter_mut", "into_iter", "map", "filter", "fold", "for_each", "collect",
-        "count", "sum", "max", "min", "any", "all", "find", "position", "enumerate", "zip", "chain",
-        "take", "skip", "rev", "cloned", "copied", "by_ref", "step_by", "flat_map", "flatten",
-        "filter_map", "peekable",
-        /* Future */
-        "poll",
-        /* Borrow / BorrowMut */
-        "borrow", "borrow_mut", NULL};
-    return rust_is_wrapper_trait_method(method_name) ||
-           rust_method_in(iterator_future, method_name);
-}
-
 /* ════════════════════════════════════════════════════════════════════
  * 3. Path & use resolution
  * ════════════════════════════════════════════════════════════════════ */
@@ -11826,6 +11808,15 @@ static int macro_match_rep(const char *pat, int pat_len, int open, const char *i
 /* Match a pattern sequence against the input from `ip`. Fragments like
  * `$x:expr` bind into `env` at the iteration `path`. Returns the input
  * position after the matched prefix, or a MACRO_ result below 0. */
+/* End of the identifier-or-number word starting at `from`, or `from` when
+ * `s[from]` starts no word. */
+static int macro_word_end(const char *s, int len, int from) {
+    int p = from;
+    while (p < len && (isalnum((unsigned char)s[p]) || s[p] == '_'))
+        p++;
+    return p;
+}
+
 static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_len, int ip,
                            MacroEnv *env, const MacroRepPath *path) {
     int pp = 0;
@@ -11835,8 +11826,21 @@ static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_
         if (pp >= pat_len)
             break;
         if (pat[pp] != '$') {
-            /* Literal: must match input verbatim. */
-            if (ip >= in_len || pat[pp] != in[ip])
+            /* Literal: must match input verbatim. A word (`mut`, `as`) is
+             * one token and matches only a whole input word, so `mut` does
+             * not take the head of `mutant`. */
+            if (ip >= in_len)
+                return MACRO_NO_MATCH;
+            int pat_word = macro_word_end(pat, pat_len, pp);
+            if (pat_word > pp) {
+                int in_word = macro_word_end(in, in_len, ip);
+                if (in_word - ip != pat_word - pp || memcmp(pat + pp, in + ip, (size_t)(in_word - ip)) != 0)
+                    return MACRO_NO_MATCH;
+                pp = pat_word;
+                ip = in_word;
+                continue;
+            }
+            if (pat[pp] != in[ip])
                 return MACRO_NO_MATCH;
             pp++;
             ip++;
@@ -12488,31 +12492,78 @@ static char *rust_macro_expand_text(CBMArena *arena, const char *def_text, const
     return expanded;
 }
 
-/* The `type Target = ..;` text of a parsed `impl Deref for ..` item, else NULL. */
-static const char *rust_deref_impl_target(CBMArena *arena, const char *text, TSNode impl) {
-    TSNode trait = ts_node_child_by_field_name(impl, "trait", 5);
-    TSNode body = ts_node_child_by_field_name(impl, "body", 4);
-    const char *trait_text = ts_node_is_null(trait) ? NULL : cbm_node_text(arena, trait, text);
-    if (!trait_text || ts_node_is_null(body) ||
-        strcmp(path_last_segment(trait_text), "Deref") != 0)
-        return NULL;
-    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
-        TSNode item = ts_node_named_child(body, i);
+static bool macro_text_has_ident(const char *s, int len, const char *w, int n);
+
+/* Whether `path`, written in an impl header of the file whose file-level `use`
+ * items are in `root`, names `core::ops::Deref`. `Deref` is not in the
+ * prelude, so a bare name needs a `use` of `core`/`std` `ops::Deref` and no
+ * other binding of the name in the file. */
+static bool rust_path_is_std_deref(CBMArena *arena, const char *source, TSNode root,
+                                   const char *path) {
+    static const char *const qualified[] = {"core::ops::Deref", "std::ops::Deref",
+                                            "::core::ops::Deref", "::std::ops::Deref", NULL};
+    if (rust_method_in(qualified, path))
+        return true;
+    if (strcmp(path, "Deref") != 0)
+        return false;
+    bool std_use = false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        TSNode item = ts_node_named_child(root, i);
+        const char *kind = ts_node_type(item);
         TSNode name = ts_node_child_by_field_name(item, "name", 4);
-        TSNode type = ts_node_child_by_field_name(item, "type", 4);
-        if (strcmp(ts_node_type(item), "type_item") != 0 || ts_node_is_null(name) ||
-            ts_node_is_null(type))
+        const char *name_text = ts_node_is_null(name) ? NULL : cbm_node_text(arena, name, source);
+        if (name_text && strcmp(name_text, "Deref") == 0 && strcmp(kind, "use_declaration") != 0)
+            return false; /* a file-level item named Deref shadows any import */
+        TSNode arg = strcmp(kind, "use_declaration") == 0
+                         ? ts_node_child_by_field_name(item, "argument", 8)
+                         : (TSNode){0};
+        const char *text = ts_node_is_null(arg) ? NULL : cbm_node_text(arena, arg, source);
+        if (!text || !macro_text_has_ident(text, (int)strlen(text), "Deref", 5))
             continue;
-        const char *name_text = cbm_node_text(arena, name, text);
-        if (name_text && strcmp(name_text, "Target") == 0)
-            return cbm_node_text(arena, type, text);
+        const char *head = text[0] == ':' ? text + 2 : text;
+        bool from_std = (strncmp(head, "core::", 6) == 0 || strncmp(head, "std::", 5) == 0) &&
+                        strstr(head, "ops") != NULL && strstr(head, " as ") == NULL;
+        if (!from_std)
+            return false;
+        std_use = true;
     }
-    return NULL;
+    return std_use;
 }
 
-/* Append the Deref impls of the expansion `expanded` to `out`. */
-static void rust_collect_expanded_derefs(CBMArena *arena, const char *expanded,
-                                         CBMRustMacroDerefArray *out) {
+/* Whether a file-level `use` in `root` may bind `name` to something outside
+ * the corpus: a path not rooted at `crate`, `self` or `super` that ends in
+ * the name, or a glob under a crate other than std, core and alloc. The
+ * innermost binding decides in Rust; any such candidate withholds. */
+static bool rust_file_may_bind_foreign(CBMArena *arena, const char *source, TSNode root,
+                                       const char *name) {
+    static const char *const local_roots[] = {"crate", "self", "super", NULL};
+    static const char *const std_roots[] = {"std", "core", "alloc", NULL};
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        TSNode item = ts_node_named_child(root, i);
+        TSNode arg = strcmp(ts_node_type(item), "use_declaration") == 0
+                         ? ts_node_child_by_field_name(item, "argument", 8)
+                         : (TSNode){0};
+        const char *text = ts_node_is_null(arg) ? NULL : cbm_node_text(arena, arg, source);
+        if (!text)
+            continue;
+        const char *head = text[0] == ':' ? text + 2 : text;
+        size_t root_len = strcspn(head, ":{ ");
+        const char *crate = cbm_arena_strndup(arena, head, root_len);
+        if (!crate || rust_method_in(local_roots, crate))
+            continue;
+        if (macro_text_has_ident(text, (int)strlen(text), name, (int)strlen(name)) ||
+            (strchr(text, '*') && !rust_method_in(std_roots, crate)))
+            return true;
+    }
+    return false;
+}
+
+/* Append to `out` what the expansion `expanded` declares on its impl self
+ * types: each non-cfg-gated `impl Deref` whose trait path names
+ * `core::ops::Deref` in the invoking file (`root`), and the name of every
+ * method of every other impl, which the wrapper itself answers. */
+static void rust_collect_expanded_impls(CBMArena *arena, const char *source, TSNode file_root,
+                                        const char *expanded, CBMRustMacroDerefArray *out) {
     TSParser *parser = ts_parser_new();
     if (!parser)
         return;
@@ -12525,15 +12576,37 @@ static void rust_collect_expanded_derefs(CBMArena *arena, const char *expanded,
          i++) {
         TSNode impl = ts_node_named_child(root, i);
         TSNode type = ts_node_child_by_field_name(impl, "type", 4);
-        if (strcmp(ts_node_type(impl), "impl_item") != 0 || ts_node_is_null(type))
+        TSNode body = ts_node_child_by_field_name(impl, "body", 4);
+        if (strcmp(ts_node_type(impl), "impl_item") != 0 || ts_node_is_null(type) ||
+            ts_node_is_null(body) || rust_item_has_attribute(expanded, impl, "cfg") ||
+            rust_item_has_attribute(expanded, impl, "cfg_attr"))
             continue;
-        const char *target = rust_deref_impl_target(arena, expanded, impl);
         const char *receiver = cbm_node_text(arena, type, expanded);
-        if (!target || !receiver ||
-            !rust_macro_facts_reserve(arena, (void **)&out->items, out->count, &out->cap,
-                                      sizeof(*out->items)))
-            continue;
-        out->items[out->count++] = (CBMRustMacroDeref){.receiver = receiver, .target = target};
+        TSNode trait = ts_node_child_by_field_name(impl, "trait", 5);
+        const char *trait_text = ts_node_is_null(trait) ? NULL : cbm_node_text(arena, trait, expanded);
+        bool is_deref = trait_text && strcmp(path_last_segment(trait_text), "Deref") == 0;
+        for (uint32_t k = 0; receiver && k < ts_node_named_child_count(body); k++) {
+            TSNode member = ts_node_named_child(body, k);
+            TSNode name = ts_node_child_by_field_name(member, "name", 4);
+            TSNode value = ts_node_child_by_field_name(member, "type", 4);
+            const char *name_text = ts_node_is_null(name) ? NULL : cbm_node_text(arena, name, expanded);
+            CBMRustMacroDeref entry = {.receiver = receiver};
+            if (!name_text)
+                continue;
+            if (is_deref && strcmp(ts_node_type(member), "type_item") == 0 &&
+                strcmp(name_text, "Target") == 0 && !ts_node_is_null(value)) {
+                if (!rust_path_is_std_deref(arena, source, file_root, trait_text))
+                    continue;
+                entry.target = cbm_node_text(arena, value, expanded);
+            } else if (!is_deref && strcmp(ts_node_type(member), "function_item") == 0) {
+                entry.method = name_text;
+            } else {
+                continue;
+            }
+            if (rust_macro_facts_reserve(arena, (void **)&out->items, out->count, &out->cap,
+                                         sizeof(*out->items)))
+                out->items[out->count++] = entry;
+        }
     }
     if (tree)
         ts_tree_delete(tree);
@@ -12566,22 +12639,24 @@ void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
                        : NULL;
     TSNode root = tree ? ts_tree_root_node(tree) : (TSNode){0};
     for (uint32_t i = 0; !ts_node_is_null(root) && i < ts_node_named_child_count(root); i++) {
-        TSNode item = ts_node_named_child(root, i);
+        TSNode statement = ts_node_named_child(root, i);
+        if (rust_item_is_cfg_gated(source, statement))
+            continue;
+        TSNode item = statement;
         if (strcmp(ts_node_type(item), "expression_statement") == 0 &&
             ts_node_named_child_count(item) == 1)
             item = ts_node_named_child(item, 0);
         TSNode macro = strcmp(ts_node_type(item), "macro_invocation") == 0
                            ? ts_node_child_by_field_name(item, "macro", 5)
                            : (TSNode){0};
-        if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "identifier") != 0 ||
-            rust_item_is_cfg_gated(source, item))
+        if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "identifier") != 0)
             continue;
         const char *name = cbm_node_text(arena, macro, source);
-        bool listed = false;
-        for (int n = 0; name && names[n] && !listed; n++)
-            listed = strcmp(names[n], name) == 0;
+        const char *def_text = name ? rust_macro_table_unique_text(table, name) : NULL;
         TSNode args_node = rust_macro_argument_node(item);
-        char *args_text = listed && !ts_node_is_null(args_node)
+        char *args_text = def_text && rust_bytes_contain(def_text, (int)strlen(def_text), "impl") &&
+                                  !ts_node_is_null(args_node) &&
+                                  !rust_file_may_bind_foreign(arena, source, root, name)
                               ? cbm_node_text(arena, args_node, source)
                               : NULL;
         if (!args_text)
@@ -12589,10 +12664,9 @@ void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
         const char *args = NULL;
         int args_len = 0;
         rust_macro_strip_outer(args_text, (int)strlen(args_text), &args, &args_len);
-        char *expanded = rust_macro_expand_text(
-            arena, rust_macro_table_unique_text(table, name), args, args_len);
+        char *expanded = rust_macro_expand_text(arena, def_text, args, args_len);
         if (expanded)
-            rust_collect_expanded_derefs(arena, expanded, out);
+            rust_collect_expanded_impls(arena, source, root, expanded, out);
     }
     if (tree)
         ts_tree_delete(tree);
@@ -16559,15 +16633,13 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_unresolved_call(ctx, mname, "trait_scope_identity");
                 return;
             }
-            /* A prelude trait name on a receiver with no method of that name
-             * proves no target: `<type>.<method>` names no item. Published as
-             * a resolution it would make the site ambiguous against the
-             * project pass's inherent hit (`query.iter()` on a `Query` read
-             * only through a file-local placeholder), so it stays unresolved. */
+            /* No method of that name proves no target, prelude trait names
+             * (`iter`, `map`, `clone`) included: a guessed `<type>.<method>`
+             * names no item and would make the site ambiguous against the
+             * project pass's inherent hit (`query.iter()` on a `Query` the
+             * file-local pass reads only as a placeholder). */
             rust_emit_unresolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
-                                      is_prelude_trait_method(mname)
-                                          ? "prelude_trait_method_not_proven"
-                                          : "method_not_found");
+                                      "method_not_found");
             return;
         }
 
