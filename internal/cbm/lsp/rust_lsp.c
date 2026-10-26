@@ -352,6 +352,19 @@ static bool rust_is_wrapper_trait_method(const char *method_name) {
     return rust_method_in(RUST_WRAPPER_TRAIT_METHODS, method_name);
 }
 
+/* Method names of the prelude traits (Iterator, Future, Borrow and the
+ * wrapper traits Clone, AsRef, ...) that a receiver can have through an impl
+ * the resolver does not see. */
+static bool rust_is_prelude_trait_method(const char *method_name) {
+    static const char *const iterator_future[] = {
+        "next", "iter", "iter_mut", "into_iter", "map", "filter", "fold", "for_each", "collect",
+        "count", "sum", "max", "min", "any", "all", "find", "position", "enumerate", "zip", "chain",
+        "take", "skip", "rev", "cloned", "copied", "by_ref", "step_by", "flat_map", "flatten",
+        "filter_map", "peekable", "poll", "borrow", "borrow_mut", NULL};
+    return rust_is_wrapper_trait_method(method_name) ||
+           rust_method_in(iterator_future, method_name);
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 3. Path & use resolution
  * ════════════════════════════════════════════════════════════════════ */
@@ -16678,13 +16691,18 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_unresolved_call(ctx, mname, "trait_scope_identity");
                 return;
             }
-            /* No method of that name proves no target, prelude trait names
-             * (`iter`, `map`, `clone`) included: a guessed `<type>.<method>`
-             * names no item and would make the site ambiguous against the
-             * project pass's inherent hit (`query.iter()` on a `Query` the
-             * file-local pass reads only as a placeholder). */
+            /* No method of that name proves no target. For a prelude trait
+             * name (`iter`, `map`, `clone`) the receiver may still have it
+             * through a trait impl the resolver cannot prove (`Box<S>::clone`
+             * reaches `S::clone` only when `S: !Clone`), so that stop says so.
+             * A guessed `<type>.<method>` names no item and would make the
+             * site ambiguous against the project pass's inherent hit
+             * (`query.iter()` on a `Query` the file-local pass reads only as
+             * a placeholder). */
             rust_emit_unresolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
-                                      "method_not_found");
+                                      rust_is_prelude_trait_method(mname)
+                                          ? "prelude_trait_method_not_proven"
+                                          : "method_not_found");
             return;
         }
 

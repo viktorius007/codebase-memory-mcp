@@ -56,7 +56,9 @@
  * raw_pointer_autoderef_not_allowed,
  * trait_reference_dispatch_unproved, trait_mutable_dispatch_unproved,
  * trait_wrapper_dispatch_unproved, inherent_self_type_not_proven, macro_call_not_proven,
- * trait_receiver_shape (shape details are not reason codes). */
+ * trait_receiver_shape (shape details are not reason codes),
+ * prelude_trait_method_not_proven (no method of a prelude trait's name is found on the
+ * receiver, which may still have it through an impl the resolver cannot prove). */
 void cbm_pipeline_record_unresolved(cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                     const char *caller, const char *name, const char *kind,
                                     const char *reason, int line, uint32_t start, uint32_t end);
