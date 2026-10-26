@@ -1911,6 +1911,29 @@ bool cbm_rust_modtree_extern_outside(const CBMRustModTree *tree, const char *mod
     return true;
 }
 
+const char *cbm_rust_modtree_extern_root(const CBMRustModTree *tree, const char *module_qn,
+                                         const char *name) {
+    int file = tree && module_qn && name ? cbm_idxmemo_get(&tree->file_by_qn, module_qn) : -1;
+    if (file < 0) {
+        return NULL;
+    }
+    const char *root = NULL;
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        char key[RMT_KEY_MAX];
+        int written = snprintf(key, sizeof(key), "%d\x1f%s", tree->modules[m].crate, name);
+        int32_t target = written > 0 && written < (int)sizeof(key)
+                             ? cbm_idxmemo_get(&tree->externs, key)
+                             : -1;
+        int root_module = target > 0 ? tree->crates[target - 1].root_module : -1;
+        const char *qn = root_module >= 0 ? tree->files[tree->modules[root_module].file].qn : NULL;
+        if (!qn || (root && strcmp(root, qn) != 0)) {
+            return NULL;
+        }
+        root = qn;
+    }
+    return root;
+}
+
 static bool rmt_is_ancestor(const CBMRustModTree *tree, int ancestor, int module) {
     for (int m = tree->modules[module].parent; m >= 0; m = tree->modules[m].parent) {
         if (m == ancestor) {
