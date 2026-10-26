@@ -5625,19 +5625,24 @@ static const CBMType *rust_collect_written_type(RustLSPContext *ctx, TSNode type
  * function or method, is that function: `.await` reads its async flag. A
  * declared type alias in the result reads as the type it stands for. */
 /* The result of a bevy `Query<D, F>` method whose declared return spells
- * D through a projection (`QueryIter<'_, 's, D::ReadOnly, F>`): `iter` /
- * `iter_mut` keep the declared `QueryIter` with the read-only or the
- * mutable data as its D. NULL for any other call. */
+ * D's item through a projection (`D::Item<'_, 's>`, `ROQueryItem<'_, 's,
+ * D>`, `QueryIter<'_, 's, D::ReadOnly, F>`): `iter` / `iter_mut` keep the
+ * declared `QueryIter` with the read-only or the mutable data as its D,
+ * `get` / `single` and `get_mut` / `single_mut` the declared `Result` with
+ * the read-only or the mutable item as its value. NULL for any other call. */
 static const CBMType *rust_bevy_query_call_return(RustLSPContext *ctx, TSNode node,
                                                   const CBMRegisteredFunc *callee,
                                                   const CBMType *declared) {
+    static const char *const read_only_items[] = {"get", "single", NULL};
+    static const char *const mutable_items[] = {"get_mut", "single_mut", NULL};
     static const char *const iterators[] = {"iter", "iter_mut", NULL};
     if (!callee || !callee->receiver_type || !callee->short_name || !declared ||
         declared->kind != CBM_TYPE_TEMPLATE || declared->data.template_type.arg_count < 1) {
         return NULL;
     }
     const char *name = callee->short_name;
-    if (!rust_method_in(iterators, name)) {
+    bool item = rust_method_in(read_only_items, name) || rust_method_in(mutable_items, name);
+    if (!item && !rust_method_in(iterators, name)) {
         return NULL;
     }
     TSNode func = ts_node_child_by_field_name(node, "function", 8);
@@ -5658,13 +5663,14 @@ static const CBMType *rust_bevy_query_call_return(RustLSPContext *ctx, TSNode no
         return NULL;
     }
     const CBMType *data = query->data.template_type.template_args[0];
-    if (strcmp(name, "iter") == 0) {
+    bool read_only = rust_method_in(read_only_items, name) || strcmp(name, "iter") == 0;
+    if (read_only) {
         data = rust_bevy_query_read_only(ctx, data, 0);
     }
     int n = declared->data.template_type.arg_count;
     const CBMType **args = cbm_arena_alloc(ctx->arena, sizeof(*args) * (size_t)n);
     memcpy(args, declared->data.template_type.template_args, sizeof(*args) * (size_t)n);
-    args[0] = data;
+    args[0] = item ? rust_bevy_query_item_or_unknown(ctx, ecs, data, false, 0) : data;
     return cbm_type_template(ctx->arena, declared->data.template_type.template_name, args, n);
 }
 

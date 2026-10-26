@@ -1,0 +1,1 @@
+Query-item lane w3-query, indexing family: bindings produced by `if let Ok(..) = query.get(e) / get_mut(e) / single() / single_mut()` and `let Ok(..) = .. else` over a bevy-shaped `Query<D, F>` (crate bevy_ecs laid out as bevy lays it out). println! statements print a backtrace (the run is the truth).
