@@ -4759,6 +4759,51 @@ static const char *rust_bevy_ecs_type(RustLSPContext *ctx, const CBMType *t, con
 static const CBMType *rust_bevy_query_item(RustLSPContext *ctx, const char *ecs,
                                            const CBMType *data, bool read_only, int depth);
 
+/* The entity-access query data of fetch.rs, each with its `ReadOnly`
+ * counterpart: `type Item<'w, 's>` is the type itself with the query's
+ * lifetimes, and `D::ReadOnly` swaps a mutable access for its shared one. */
+static const struct {
+    const char *path;
+    const char *read_only;
+} RUST_BEVY_ENTITY_ACCESS[] = {
+    {"world.entity_access.entity_ref.EntityRef", "world.entity_access.entity_ref.EntityRef"},
+    {"world.entity_access.entity_mut.EntityMut", "world.entity_access.entity_ref.EntityRef"},
+    {"world.entity_access.filtered.FilteredEntityRef",
+     "world.entity_access.filtered.FilteredEntityRef"},
+    {"world.entity_access.filtered.FilteredEntityMut",
+     "world.entity_access.filtered.FilteredEntityRef"},
+    {"world.entity_access.except.EntityRefExcept", "world.entity_access.except.EntityRefExcept"},
+    {"world.entity_access.except.EntityMutExcept", "world.entity_access.except.EntityRefExcept"},
+};
+
+/* The item of an entity-access query data (`EntityMut`, `FilteredEntityRef`,
+ * `EntityMutExcept<B>` ..), read-only when `read_only`; NULL for any other
+ * shape. The bundle argument of the `Except` forms carries over. */
+static const CBMType *rust_bevy_entity_access_item(RustLSPContext *ctx, const CBMType *data,
+                                                   bool read_only) {
+    for (size_t i = 0; i < sizeof(RUST_BEVY_ENTITY_ACCESS) / sizeof(RUST_BEVY_ENTITY_ACCESS[0]);
+         i++) {
+        const char *ecs = NULL;
+        if (!rust_bevy_ecs_type(ctx, data, RUST_BEVY_ENTITY_ACCESS[i].path, &ecs)) {
+            continue;
+        }
+        if (!read_only || strcmp(RUST_BEVY_ENTITY_ACCESS[i].path,
+                                 RUST_BEVY_ENTITY_ACCESS[i].read_only) == 0) {
+            return data;
+        }
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s%s", ecs,
+                                           RUST_BEVY_ENTITY_ACCESS[i].read_only);
+        if (!cbm_registry_lookup_type(ctx->registry, qn)) {
+            return NULL;
+        }
+        return data->kind == CBM_TYPE_TEMPLATE
+                   ? cbm_type_template(ctx->arena, qn, data->data.template_type.template_args,
+                                       data->data.template_type.arg_count)
+                   : cbm_type_named(ctx->arena, qn);
+    }
+    return NULL;
+}
+
 static const CBMType *rust_bevy_query_item_or_unknown(RustLSPContext *ctx, const char *ecs,
                                                       const CBMType *data, bool read_only,
                                                       int depth) {
@@ -4816,7 +4861,7 @@ static const CBMType *rust_bevy_query_item(RustLSPContext *ctx, const char *ecs,
     if (one_arg && rust_bevy_ecs_type(ctx, data, "query.fetch.Has", NULL)) {
         return cbm_type_builtin(ctx->arena, "bool");
     }
-    return NULL;
+    return rust_bevy_entity_access_item(ctx, data, read_only);
 }
 
 /* The Item a bevy query iterator yields, through `trait`: `QueryIter<D, F>`
@@ -4868,7 +4913,8 @@ static const CBMType *rust_bevy_query_read_only(RustLSPContext *ctx, const CBMTy
             rust_bevy_query_read_only(ctx, data->data.template_type.template_args[0], depth + 1);
         return cbm_type_template(ctx->arena, "core.option.Option", &inner, 1);
     }
-    return data;
+    const CBMType *access = rust_bevy_entity_access_item(ctx, data, true);
+    return access ? access : data;
 }
 
 /* Exactly one written impl must match the full self shape. Generic impls
@@ -5301,6 +5347,30 @@ static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
     }
 }
 
+/* bevy_render's `impl IntoIterator for &'a Extract<'w, 's, P>` yields
+ * `<&'a SystemParamItem<'w, 's, P> as IntoIterator>::Item`: a borrowed
+ * Extract iterates as a shared borrow of the parameter it derefs to. P is
+ * bounded by ReadOnlySystemParam, so the item is always the read-only one,
+ * whatever borrow of the Extract is written. That shared borrow, when `t` is
+ * a borrowed `Extract<P>` and the Deref target is read
+ * (rust_bevy_system_param_item); else NULL. */
+static const CBMType *rust_bevy_extract_iterated(RustLSPContext *ctx, const CBMType *t) {
+    static const char suffix[] = ".crates.bevy_render.src.extract_param.Extract";
+    if (!t || t->kind != CBM_TYPE_REFERENCE) {
+        return NULL;
+    }
+    const CBMType *base = t->data.reference.elem;
+    const char *head = rust_std_type_head(base);
+    const char *qn = head ? rust_registered_type_qn(ctx, head) : NULL;
+    size_t len = qn ? strlen(qn) : 0;
+    if (!qn || len < sizeof(suffix) - 1 || strcmp(qn + len - (sizeof(suffix) - 1), suffix) != 0) {
+        return NULL;
+    }
+    const CBMType *target = rust_deref_step(ctx, base);
+    return target && !cbm_type_is_unknown(target) ? rust_reference_type(ctx->arena, target, true)
+                                                   : NULL;
+}
+
 /* The unique written Item, or the element fixed by a standard collection's
  * IntoIterator declaration. Borrowed maps yield pairs of borrowed elements. */
 static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType *t) {
@@ -5308,6 +5378,10 @@ static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType
     const CBMType *self = t;
     if (!self || cbm_type_is_unknown(self)) {
         return NULL;
+    }
+    const CBMType *extracted = rust_bevy_extract_iterated(ctx, t);
+    if (extracted) {
+        return rust_std_into_iter_item(ctx, extracted);
     }
     const CBMType *written = rust_written_iter_item(ctx, t, "core.iter.IntoIterator");
     if (!written) {
@@ -5837,7 +5911,7 @@ static const CBMType *rust_collect_written_type(RustLSPContext *ctx, TSNode type
 /* Type of a call expression. `*callee`, when the call names a registered
  * function or method, is that function: `.await` reads its async flag. A
  * declared type alias in the result reads as the type it stands for. */
-/* The result of a bevy `Query<D, F>` method whose declared return spells
+/* The result of a bevy `Query<D, F>` or `QueryState<D, F>` method whose declared return spells
  * D's item through a projection (`D::Item<'_, 's>`, `ROQueryItem<'_, 's,
  * D>`, `QueryIter<'_, 's, D::ReadOnly, F>`): `iter` / `iter_mut` keep the
  * declared `QueryIter` with the read-only or the mutable data as its D,
@@ -5868,10 +5942,13 @@ static const CBMType *rust_bevy_query_call_return(RustLSPContext *ctx, TSNode no
     const CBMType *query =
         rust_strip_references(rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0));
     const char *ecs = NULL;
-    const char *owner = query && query->kind == CBM_TYPE_TEMPLATE &&
-                                query->data.template_type.arg_count > 0
-                            ? rust_bevy_ecs_type(ctx, query, "system.query.Query", &ecs)
-                            : NULL;
+    bool templated = query && query->kind == CBM_TYPE_TEMPLATE &&
+                     query->data.template_type.arg_count > 0;
+    const char *owner = templated ? rust_bevy_ecs_type(ctx, query, "system.query.Query", &ecs)
+                                  : NULL;
+    if (!owner && templated) {
+        owner = rust_bevy_ecs_type(ctx, query, "query.state.QueryState", &ecs);
+    }
     if (!owner || strcmp(owner, callee->receiver_type) != 0) {
         return NULL;
     }
@@ -7942,6 +8019,11 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
             type_qn = nm;
     } else if (base->kind == CBM_TYPE_SLICE) {
         type_qn = "core.slice";
+    } else if (base->kind == CBM_TYPE_TYPE_PARAM && method_call) {
+        /* A parameter read through the enclosing impl (`self.first` with
+         * `first: C`, `C: Curve<T>`) takes its method from its bounds, as the
+         * call step's bound dispatch does. */
+        type_qn = base->data.type_param.name;
     } else {
         return cbm_type_unknown();
     }
@@ -8418,6 +8500,27 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
     return rust_wrapper_corpus_trait_method(ctx, base, method, &blocked, NULL) != NULL || blocked;
 }
 
+/* bevy's `SystemParamItem<'w, 's, P>` (`<P as SystemParam>::Item<'w, 's>`)
+ * for the parameters whose impl in system_param.rs declares the item as the
+ * parameter itself with the system's lifetimes: `Query<D, F>`, `Res<T>` and
+ * `ResMut<T>` (lifetimes are not modelled, so the item is P). NULL for any
+ * other type or parameter. */
+static const CBMType *rust_bevy_system_param_item(RustLSPContext *ctx, const CBMType *t) {
+    static const char *const same_item[] = {"system.query.Query", "change_detection.params.Res",
+                                            "change_detection.params.ResMut", NULL};
+    if (!t || t->kind != CBM_TYPE_TEMPLATE || t->data.template_type.arg_count != 1 ||
+        !rust_bevy_ecs_type(ctx, t, "system.system_param.SystemParamItem", NULL)) {
+        return NULL;
+    }
+    const CBMType *param = t->data.template_type.template_args[0];
+    for (const char *const *p = same_item; *p; p++) {
+        if (rust_bevy_ecs_type(ctx, param, *p, NULL)) {
+            return param;
+        }
+    }
+    return NULL;
+}
+
 /* The `Target` of the project's `impl Deref` for the type named `qn`, the
  * receiver's written type arguments substituted for the names the impl's self
  * type spells. NULL when the type has no single readable Deref target. */
@@ -8453,8 +8556,9 @@ static const CBMType *rust_user_deref_target(RustLSPContext *ctx, const char *qn
     }
     names[n] = NULL;
     subst[n] = NULL;
-    return rust_expand_type_aliases(ctx, rust_substitute_type(ctx->arena, target, names, subst),
-                                    0);
+    target = rust_substitute_type(ctx->arena, target, names, subst);
+    const CBMType *param = rust_bevy_system_param_item(ctx, target);
+    return param ? param : rust_expand_type_aliases(ctx, target, 0);
 }
 
 /* Returns the inner type after one Deref step: the first template arg of
@@ -16737,6 +16841,31 @@ static const CBMType *rust_callee_self_type(RustLSPContext *ctx, TSNode fn,
     return NULL;
 }
 
+/* The function-pointer signature a parameter declares through a type alias
+ * (`hook: ComponentHook` with `type ComponentHook = for<'w> fn(DeferredWorld<'w>,
+ * HookContext)`), which the written-text reading of rust_callable_param_sig
+ * cannot see. NULL when the parameter's declared type is no alias of a
+ * function pointer. */
+static const CBMType *rust_alias_fn_param_sig(RustLSPContext *ctx,
+                                              const CBMRegisteredFunc *callee, int index) {
+    if (!callee || !callee->signature || callee->signature->kind != CBM_TYPE_FUNC ||
+        !callee->signature->data.func.param_types || index < 0) {
+        return NULL;
+    }
+    const CBMType *const *declared = callee->signature->data.func.param_types;
+    for (int i = 0; i < index; i++) {
+        if (!declared[i]) {
+            return NULL;
+        }
+    }
+    const CBMType *written = declared[index];
+    if (!written || written->kind != CBM_TYPE_NAMED) {
+        return NULL;
+    }
+    const CBMType *t = rust_expand_type_aliases(ctx, written, 0);
+    return t && t != written && t->kind == CBM_TYPE_FUNC && t->data.func.param_types ? t : NULL;
+}
+
 /* The parameter types the project function `closure` is passed to declares
  * for it, written into `out[RUST_CLOSURE_PARAM_MAX]` where the std table left
  * them unknown. The callee is the one of the call the closure is an argument
@@ -16764,6 +16893,9 @@ static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
     const CBMRegisteredFunc *callee = rust_argument_callee(ctx, call, arg, args, &index);
     const CBMType *sig =
         callee && callee->rust_callable_params ? callee->rust_callable_params[index] : NULL;
+    if (!sig) {
+        sig = rust_alias_fn_param_sig(ctx, callee, index);
+    }
     if (!sig) {
         return;
     }

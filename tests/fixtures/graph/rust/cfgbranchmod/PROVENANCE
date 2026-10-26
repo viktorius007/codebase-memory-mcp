@@ -1,0 +1,1 @@
+w5-bind closure:scope: the `mod` items in the branches of a cfg-alias macro from another crate (`plat::multi_threaded! { if { mod pool; } else { mod single; } }`) mount as candidates, so a type named in pool.rs resolves to its own module. println! statements print a backtrace (the run is the truth).

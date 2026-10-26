@@ -892,35 +892,26 @@ static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
     return true;
 }
 
-/* The out-of-line `mod name;` items written in the braces of an item macro
- * the local expander cannot read (a path, an alias, another file's
- * definition), as candidates the tree mounts only when nothing else can bind
- * the name (rmt_mount_macro_mods). */
-static void rmf_scan_macro_mod_candidates(RmfScan *scan, TSNode invocation) {
-    TSNode tokens = cbm_find_child_by_kind(invocation, "token_tree");
-    if (ts_node_is_null(tokens))
-        return;
-    uint32_t start = ts_node_start_byte(tokens);
-    uint32_t end = ts_node_end_byte(tokens);
-    if (end < start + 2 || scan->source[start] != '{' || scan->source[end - 1] != '}')
-        return;
-    CBMArena *arena = &scan->facts->arena;
-    char *body = cbm_arena_strndup(arena, scan->source + start + 1, end - start - 2);
+/* Push the out-of-line `mod name;` items of `body` (item text) as candidates.
+ * False when `body` does not parse as items. */
+static bool rmf_scan_mod_candidate_items(RmfScan *scan, char *body) {
     /* A cheap byte filter only; the parse below finds `mod` as a token,
      * whatever spacing or comments follow it. */
     if (!body || !strstr(body, "mod"))
-        return;
+        return true;
     TSParser *parser = ts_parser_new();
     if (!parser)
-        return;
+        return true;
     TSTree *tree = NULL;
     if (ts_parser_set_language(parser, tree_sitter_rust()))
         tree = ts_parser_parse_string(parser, NULL, body, (uint32_t)strlen(body));
     ts_parser_delete(parser);
     if (!tree)
-        return;
+        return true;
     TSNode items = ts_tree_root_node(tree);
-    for (uint32_t i = 0; !ts_node_has_error(items) && i < ts_node_named_child_count(items); i++) {
+    bool parsed = !ts_node_has_error(items);
+    CBMArena *arena = &scan->facts->arena;
+    for (uint32_t i = 0; parsed && i < ts_node_named_child_count(items); i++) {
         TSNode item = ts_node_named_child(items, i);
         TSNode name = ts_node_child_by_field_name(item, "name", 4);
         if (strcmp(ts_node_type(item), "mod_item") != 0 || ts_node_is_null(name) ||
@@ -933,6 +924,37 @@ static void rmf_scan_macro_mod_candidates(RmfScan *scan, TSNode invocation) {
                                    .text = cbm_rust_path_attribute(arena, body, item)});
     }
     ts_tree_delete(tree);
+    return parsed;
+}
+
+/* The text inside the braces of a `{ .. }` token tree, or NULL. */
+static char *rmf_brace_body(RmfScan *scan, TSNode tokens) {
+    uint32_t start = ts_node_start_byte(tokens);
+    uint32_t end = ts_node_end_byte(tokens);
+    if (end < start + 2 || scan->source[start] != '{' || scan->source[end - 1] != '}')
+        return NULL;
+    return cbm_arena_strndup(&scan->facts->arena, scan->source + start + 1, end - start - 2);
+}
+
+/* The out-of-line `mod name;` items written in the braces of an item macro
+ * the local expander cannot read (a path, an alias, another file's
+ * definition), as candidates the tree mounts only when nothing else can bind
+ * the name (rmt_mount_macro_mods). A body that is no item list is read one
+ * level down, for the branches of a cfg-alias macro
+ * (`multi_threaded! { if { mod a; } else { mod b; } }`): which branch the
+ * build selects is not known here, and a candidate never displaces a module
+ * that something else binds. */
+static void rmf_scan_macro_mod_candidates(RmfScan *scan, TSNode invocation) {
+    TSNode tokens = cbm_find_child_by_kind(invocation, "token_tree");
+    if (ts_node_is_null(tokens))
+        return;
+    if (rmf_scan_mod_candidate_items(scan, rmf_brace_body(scan, tokens)))
+        return;
+    for (uint32_t i = 0; i < ts_node_named_child_count(tokens); i++) {
+        TSNode branch = ts_node_named_child(tokens, i);
+        if (strcmp(ts_node_type(branch), "token_tree") == 0)
+            rmf_scan_mod_candidate_items(scan, rmf_brace_body(scan, branch));
+    }
 }
 
 /* Proc macros export a macro name, not the implementation function as a

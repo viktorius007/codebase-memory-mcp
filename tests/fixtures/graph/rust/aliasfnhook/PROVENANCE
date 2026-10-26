@@ -1,0 +1,1 @@
+w5-bind G002: a closure passed for a parameter whose type is an alias of a function pointer (`hook: ComponentHook`, `type ComponentHook = for<'w> fn(DeferredWorld<'w>, HookContext)`) takes its parameter types from the alias. println! statements print a backtrace (the run is the truth).

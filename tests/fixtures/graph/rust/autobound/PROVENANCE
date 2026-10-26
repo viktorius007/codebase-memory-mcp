@@ -1,0 +1,1 @@
+w5-bind closure:scope: a closure parameter typed `&Scope<..>` by its callee keeps the head when the inherent impl bounds its parameters only by auto traits and lifetimes (`impl<T: Send + 's> Scope<'s, T>`). println! statements print a backtrace (the run is the truth).
