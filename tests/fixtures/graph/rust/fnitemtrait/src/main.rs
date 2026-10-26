@@ -1,5 +1,20 @@
+pub struct Built;
+impl Built {
+    pub fn finish(self) -> u32 {
+        println!("Built::finish\n{}", std::backtrace::Backtrace::force_capture());
+        4
+    }
+}
+
 pub trait Configs<M> {
     fn into_c(self) -> u32;
+    fn configure(self) -> Built
+    where
+        Self: Sized,
+    {
+        println!("Configs::configure default\n{}", std::backtrace::Backtrace::force_capture());
+        Built
+    }
     fn after(self) -> u32
     where
         Self: Sized,
@@ -76,6 +91,10 @@ fn tupled() -> u32 {
     (sys, other).after()
 }
 
+fn tupled_chain() -> u32 {
+    (sys, other).configure().finish()
+}
+
 fn withheld() {
     sys.required();
     sys.deco();
@@ -83,7 +102,7 @@ fn withheld() {
 }
 
 fn main() {
-    let configured = single() + tupled() + sys.into_c() + sys() as u32 + other() as u32;
+    let configured = single() + tupled() + tupled_chain() + sys.into_c() + sys() as u32 + other() as u32;
     withheld();
     println!("{configured}");
 }

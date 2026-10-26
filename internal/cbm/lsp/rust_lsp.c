@@ -6066,7 +6066,8 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                  * across each link. */
                 const CBMType *t = rust_eval_member_access(ctx, recv, mname, true, callee);
                 const CBMRegisteredFunc *open_decl =
-                    !*callee && (!base || base->kind == CBM_TYPE_FUNC || cbm_type_is_unknown(base))
+                    !*callee && (!base || base->kind == CBM_TYPE_FUNC ||
+                                 base->kind == CBM_TYPE_TUPLE || cbm_type_is_unknown(base))
                         ? rust_open_receiver_trait_method(ctx, value, mname)
                         : NULL;
                 if (open_decl) {
