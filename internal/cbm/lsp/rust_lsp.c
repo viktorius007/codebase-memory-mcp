@@ -138,6 +138,8 @@ static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const cha
 static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *ctx,
                                                                 TSNode value,
                                                                 const char *method);
+static bool rust_trait_method_overridden_open(RustLSPContext *ctx, const char *trait_qn,
+                                              const char *method);
 static bool rust_type_unproven(const CBMType *t, const char *const *params, int depth);
 static const CBMType *rust_trait_return_type(RustLSPContext *ctx, const CBMType *t,
                                              const CBMRegisteredType *owner, int depth);
@@ -14959,8 +14961,9 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
  * of the enclosing item (an unregistered name a bound declares): the
  * self type is not a concrete type with an impl, so the call names the
  * trait's declaration of `m` (reached through supertraits; every reachable
- * declaration must agree), as rust-analyzer resolves the path. Assumes no
- * corpus impl of the trait has a trait-object self type. */
+ * declaration must agree), as rust-analyzer resolves the path. A blanket
+ * impl that defines `m` can apply to such a self, so it withholds. Assumes
+ * no corpus impl of the trait has a trait-object self type. */
 static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPContext *ctx,
                                                                       const char *trait_qn,
                                                                       const char *method,
@@ -14999,7 +15002,8 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
     const CBMRegisteredFunc *declaration = NULL;
     bool ambiguous = false;
     rust_bound_trait_declarations(ctx, trait_qn, method, true, 0, NULL, &declaration, &ambiguous);
-    if (ambiguous || !declaration || (declaration->flags & CBM_FUNC_FLAG_RUST_SELF) == 0)
+    if (ambiguous || !declaration || (declaration->flags & CBM_FUNC_FLAG_RUST_SELF) == 0 ||
+        rust_trait_method_overridden_open(ctx, declaration->receiver_type, method))
         return NULL;
     return declaration;
 }

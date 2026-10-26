@@ -30,6 +30,20 @@ impl<T: Exec + ?Sized> Caps for T {
     }
 }
 
+pub trait Erased {
+    fn erased(&self) -> u32;
+}
+impl<T: Exec + ?Sized> Erased for T {
+    fn erased(&self) -> u32 {
+        println!("Erased::erased blanket\n{}", std::backtrace::Backtrace::force_capture());
+        5
+    }
+}
+
+fn via_generic<S: Exec>(store: &S) -> u32 {
+    Erased::erased(store)
+}
+
 fn via_dyn(store: &mut dyn Exec) -> u32 {
     Store::get(store)
 }
@@ -39,6 +53,6 @@ fn via_concrete(mem: &mut Mem) -> u32 {
 }
 
 fn main() {
-    let total = via_dyn(&mut Mem) + via_dyn(&mut Disk) + via_concrete(&mut Mem) + Disk.fetch();
+    let total = via_dyn(&mut Mem) + via_dyn(&mut Disk) + via_concrete(&mut Mem) + Disk.fetch() + via_generic(&Mem);
     println!("{total}");
 }
