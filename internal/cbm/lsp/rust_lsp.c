@@ -6845,6 +6845,16 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                 strcmp(inner_qn, ctx->self_type_qn) == 0) {
                 return cbm_type_unknown();
             }
+            /* `*x` on an owned single-field tuple struct is
+             * `*Deref::deref(&x)` through an unread impl, typically
+             * `#[derive(Deref)]`: the result is the unseen Target, never the
+             * operand's own type. Other shapes keep the operand type, which
+             * covers a binding whose reference layer was not recorded. */
+            if (inner_qn && cbm_registry_lookup_type(ctx->registry, inner_qn) &&
+                !cbm_type_is_unknown(rust_lookup_field(ctx, inner_qn, "0", 0)) &&
+                cbm_type_is_unknown(rust_lookup_field(ctx, inner_qn, "1", 0))) {
+                return cbm_type_unknown();
+            }
             return inner;
         }
         const CBMType *base = rust_strip_references(inner);

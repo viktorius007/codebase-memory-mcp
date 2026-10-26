@@ -1,0 +1,1 @@
+rs-recv lane: a dependency crate's HashMap/HashSet in a module declared through a local macro_rules! that emits it (mounted), re-exported through collections/mod.rs; and a macro that drops `mod dep;` while a dependency crate named dep exists (not mounted: `use dep::Thing` is the dependency's). Receivers typed by field, param, qualified param, local annotation and constructor.
