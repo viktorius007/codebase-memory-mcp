@@ -2040,8 +2040,8 @@ static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMC
             n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
                          i > 0 ? "," : "", a->index, esc_e, esc_v);
         } else {
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "",
-                         a->index, esc_e);
+            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
+                         esc_e);
         }
         /* snprintf reports the untruncated length; an object the local or the props
          * buffer cannot hold whole is dropped and closes the array. */
