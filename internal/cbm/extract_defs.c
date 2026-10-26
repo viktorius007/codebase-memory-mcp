@@ -5492,6 +5492,50 @@ static bool rust_subtree_has_kind(TSNode node, const char *kind, int depth) {
     return false;
 }
 
+/* True when the bound `b` (one child of a trait_bounds list) is a lifetime,
+ * `?Sized`, or one of the auto and marker traits Send, Sync, Unpin, Sized,
+ * written bare or as a path. */
+static bool rust_bound_is_auto(TSNode b, const char *source) {
+    const char *kind = ts_node_type(b);
+    if (strcmp(kind, "lifetime") == 0 || strcmp(kind, "removed_trait_bound") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "scoped_type_identifier") == 0) {
+        b = ts_node_child_by_field_name(b, TS_FIELD("name"));
+        kind = ts_node_is_null(b) ? "" : ts_node_type(b);
+    }
+    if (strcmp(kind, "type_identifier") != 0) {
+        return false;
+    }
+    static const char *const autos[] = {"Send", "Sync", "Unpin", "Sized", NULL};
+    uint32_t start = ts_node_start_byte(b);
+    size_t len = (size_t)(ts_node_end_byte(b) - start);
+    for (const char *const *a = autos; *a; a++) {
+        if (strlen(*a) == len && strncmp(source + start, *a, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when every trait_bounds list under `node` holds only bounds
+ * rust_bound_is_auto accepts. */
+static bool rust_bounds_auto_only(TSNode node, const char *source, int depth) {
+    if (depth > 32) {
+        return false;
+    }
+    bool list = strcmp(ts_node_type(node), "trait_bounds") == 0;
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (list ? !rust_bound_is_auto(child, source)
+                 : !rust_bounds_auto_only(child, source, depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool rust_ident_byte(char c) {
     return isalnum((unsigned char)c) || c == '_';
 }
@@ -10210,8 +10254,16 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
     TSNode where = cbm_find_child_by_kind(node, "where_clause");
     owner.self_needs_proof = type_param_count > 0 || !ts_node_is_null(where);
-    if (ts_node_is_null(where) &&
-        (ts_node_is_null(params) || !rust_subtree_has_kind(params, "trait_bounds", 0))) {
+    /* An inherent impl whose parameters carry only lifetime, `?Sized` or
+     * auto-trait bounds (`impl<'s, T: Send + 's> Scope<'s, T>`) selects no
+     * specialized method by them: every method a compiling call names is the
+     * one its head declares, so the parameters count as unconstrained. A trait
+     * impl keeps the strict reading, since its bounds decide which impl applies. */
+    bool auto_only = !impl_trait &&
+                     (ts_node_is_null(params) || rust_bounds_auto_only(params, ctx->source, 0)) &&
+                     (ts_node_is_null(where) || rust_bounds_auto_only(where, ctx->source, 0));
+    if (auto_only || (ts_node_is_null(where) && (ts_node_is_null(params) ||
+                                                 !rust_subtree_has_kind(params, "trait_bounds", 0)))) {
         owner.unbounded_params = owner.type_params;
     }
     uint32_t count = ts_node_child_count(body);
