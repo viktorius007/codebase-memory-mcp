@@ -1,0 +1,10 @@
+Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
+defects, C/C++: `#line` after same-line comment not blanked,
+preprocessor.cpp). The compiler honours both directives: the program prints
+"main at 951" and exits 0. main calls answer only through the object-like
+macro ASK, so that call comes from the preprocessed pass
+(cbm_preprocess_with_map, then the line map). Expected graph: the call
+main -> answer at main.c:19 (answer at main.c:11, main at main.c:17, both
+also from the raw pass). Without the fix the expansion keeps
+`#line 950 "gen.y"`, the call maps to gen.y:952, and the main-file check
+rejects it: no main -> answer edge.
