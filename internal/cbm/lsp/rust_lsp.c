@@ -5347,6 +5347,28 @@ static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
     }
 }
 
+/* bevy_render's `impl IntoIterator for &'a Extract<'w, 's, P>` yields
+ * `<&'a SystemParamItem<'w, 's, P> as IntoIterator>::Item`: a borrowed
+ * Extract iterates as a borrow of the parameter it derefs to. That borrow,
+ * when `t` is `&Extract<P>` or `&mut Extract<P>` and the Deref target is read
+ * (rust_bevy_system_param_item); else NULL. */
+static const CBMType *rust_bevy_extract_iterated(RustLSPContext *ctx, const CBMType *t) {
+    static const char suffix[] = ".crates.bevy_render.src.extract_param.Extract";
+    if (!t || t->kind != CBM_TYPE_REFERENCE) {
+        return NULL;
+    }
+    const CBMType *base = t->data.reference.elem;
+    const char *head = rust_std_type_head(base);
+    const char *qn = head ? rust_registered_type_qn(ctx, head) : NULL;
+    size_t len = qn ? strlen(qn) : 0;
+    if (!qn || len < sizeof(suffix) - 1 || strcmp(qn + len - (sizeof(suffix) - 1), suffix) != 0) {
+        return NULL;
+    }
+    const CBMType *target = rust_deref_step(ctx, base);
+    return target && !cbm_type_is_unknown(target) ? rust_reference_like(ctx->arena, target, t)
+                                                   : NULL;
+}
+
 /* The unique written Item, or the element fixed by a standard collection's
  * IntoIterator declaration. Borrowed maps yield pairs of borrowed elements. */
 static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType *t) {
@@ -5354,6 +5376,10 @@ static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType
     const CBMType *self = t;
     if (!self || cbm_type_is_unknown(self)) {
         return NULL;
+    }
+    const CBMType *extracted = rust_bevy_extract_iterated(ctx, t);
+    if (extracted) {
+        return rust_std_into_iter_item(ctx, extracted);
     }
     const CBMType *written = rust_written_iter_item(ctx, t, "core.iter.IntoIterator");
     if (!written) {
