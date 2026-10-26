@@ -7525,6 +7525,11 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "block") == 0) {
         return rust_eval_block_value(ctx, node);
     }
+    /* `unsafe { .. }` only lifts a check: its value is its block's. */
+    if (strcmp(kind, "unsafe_block") == 0) {
+        TSNode body = cbm_find_child_by_kind(node, "block");
+        return ts_node_is_null(body) ? cbm_type_unknown() : rust_eval_block_value(ctx, body);
+    }
     if (strcmp(kind, "loop_expression") == 0) {
         return cbm_type_builtin(ctx->arena, "()");
     }
