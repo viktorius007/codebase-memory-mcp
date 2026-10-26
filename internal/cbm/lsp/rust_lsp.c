@@ -16423,6 +16423,30 @@ static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustC
     return true;
 }
 
+/* `<T>::f` and `<T<A>>::f` name what `T::f` names: the brackets only let a
+ * type path carry generic arguments. The path spelled without them, or NULL
+ * when the bracketed type is no type path (a reference, a tuple, a slice, a
+ * qualified `<T as Trait>`). */
+static const char *rust_unbracketed_path(RustLSPContext *ctx, TSNode callee) {
+    TSNode head = ts_node_child_by_field_name(callee, "path", 4);
+    TSNode name = ts_node_child_by_field_name(callee, "name", 4);
+    if (ts_node_is_null(head) || ts_node_is_null(name) ||
+        strcmp(ts_node_type(head), "bracketed_type") != 0 || ts_node_named_child_count(head) != 1)
+        return NULL;
+    TSNode type = ts_node_named_child(head, 0);
+    if (strcmp(ts_node_type(type), "generic_type") == 0)
+        type = ts_node_child_by_field_name(type, "type", 4);
+    const char *kind = ts_node_is_null(type) ? "" : ts_node_type(type);
+    if (strcmp(kind, "type_identifier") != 0 && strcmp(kind, "scoped_type_identifier") != 0)
+        return NULL;
+    char *type_path = rust_node_text(ctx, type);
+    char *item = rust_node_text(ctx, name);
+    if (!type_path || !item)
+        return NULL;
+    rust_strip_turbofish(type_path);
+    return cbm_arena_sprintf(ctx->arena, "%s::%s", type_path, item);
+}
+
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
  * the file-layout fallbacks (file outside every crate, undecidable name).
@@ -16432,6 +16456,11 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
                                     RustCallTarget *out) {
     if (rust_explicit_trait_target(ctx, callee, out))
         return true;
+    if (path[0] == '<') {
+        path = rust_unbracketed_path(ctx, callee);
+        if (!path)
+            return false;
+    }
     if (strncmp(path, "Self::", 6) == 0) {
         return rust_self_path_target(ctx, callee, path, out);
     }
