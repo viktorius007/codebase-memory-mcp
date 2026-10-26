@@ -15,6 +15,17 @@ macro_rules! labelled {
     };
 }
 
+macro_rules! pick {
+    ($k:literal, $msg:literal, $e:expr) => {
+        $e
+    };
+    ($k:ident, $msg:literal, $e:expr) => {
+        stringify!($e)
+    };
+}
+
+fn picked() -> &'static str { println!("picked\n{}", std::backtrace::Backtrace::force_capture()); "picked" }
+
 fn four() -> u32 { println!("four\n{}", std::backtrace::Backtrace::force_capture()); 4 }
 fn name(s: &str) -> usize { println!("name\n{}", std::backtrace::Backtrace::force_capture()); s.len() }
 fn bytes() -> u8 { println!("bytes\n{}", std::backtrace::Backtrace::force_capture()); 1 }
@@ -29,7 +40,17 @@ fn tt_arm() {
     println!("{:?}", pair);
 }
 
+fn ident_is_no_literal() {
+    let _ = pick!(tag, "message", picked());
+}
+
+fn literal_arm_taken() {
+    let _ = pick!(-1, "message", picked());
+}
+
 fn main() {
+    ident_is_no_literal();
+    literal_arm_taken();
     literal_arm();
     tt_arm();
 }

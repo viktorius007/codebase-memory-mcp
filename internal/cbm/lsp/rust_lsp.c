@@ -11392,6 +11392,10 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         int string_end = macro_consume_string(s, len, from);
         if (string_end > from)
             return string_end;
+        if (c == 'b' && from + 1 < len && s[from + 1] == '\'') {
+            int q = macro_consume_fragment(s, len, from + 1, "literal");
+            return q > from + 1 ? q : from;
+        }
         if (c == '\'') {
             int q = from + 1;
             if (q < len && s[q] == '\\') {
@@ -11407,7 +11411,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         if (c == '-' || (c >= '0' && c <= '9')) {
             int p = from;
             if (c == '-')
-                p++;
+                p = macro_skip_ws(s, len, p + 1);
+            if (p >= len || s[p] < '0' || s[p] > '9')
+                return from; /* `-` alone is no literal */
             while (p < len && ((s[p] >= '0' && s[p] <= '9') || s[p] == '_' || s[p] == '.' ||
                                s[p] == 'x' || s[p] == 'X' || s[p] == 'b' || s[p] == 'o' ||
                                (s[p] >= 'a' && s[p] <= 'f') || (s[p] >= 'A' && s[p] <= 'F')))
@@ -11416,7 +11422,13 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             int after = macro_consume_ident(s, len, p);
             return after;
         }
-        return macro_consume_ident(s, len, from);
+        /* Of the identifier-shaped tokens only `true` and `false` are
+         * literals; any other identifier leaves this arm for the next. */
+        int word_end = macro_consume_ident(s, len, from);
+        if ((word_end - from == 4 && memcmp(s + from, "true", 4) == 0) ||
+            (word_end - from == 5 && memcmp(s + from, "false", 5) == 0))
+            return word_end;
+        return from;
     }
     if (strcmp(frag, "tt") == 0) {
         char c = s[from];
