@@ -16487,27 +16487,75 @@ static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *
     return selected;
 }
 
-/* True when `t` holds an argument this file cannot name: a type parameter,
- * an unknown, or an unregistered single-segment name (a parameter carried
- * out of a trait declaration's return type). */
+/* True when type argument `arg` is one this file cannot name: a type
+ * parameter, an unknown, or an unregistered single-segment name (a
+ * parameter carried out of a trait declaration's return type). */
+static bool rust_type_arg_open(RustLSPContext *ctx, const CBMType *arg) {
+    return !arg || cbm_type_is_unknown(arg) || arg->kind == CBM_TYPE_TYPE_PARAM ||
+           (arg->kind == CBM_TYPE_NAMED && !strchr(arg->data.named.qualified_name, '.') &&
+            !cbm_registry_lookup_type(ctx->registry, arg->data.named.qualified_name));
+}
+
+/* True when `t` holds an open argument (rust_type_arg_open). */
 static bool rust_type_has_open_arg(RustLSPContext *ctx, const CBMType *t) {
     if (!t || t->kind != CBM_TYPE_TEMPLATE)
         return false;
     for (int i = 0; i < t->data.template_type.arg_count; i++) {
-        const CBMType *arg = t->data.template_type.template_args[i];
-        if (!arg || cbm_type_is_unknown(arg) || arg->kind == CBM_TYPE_TYPE_PARAM ||
-            (arg->kind == CBM_TYPE_NAMED && !strchr(arg->data.named.qualified_name, '.') &&
-             !cbm_registry_lookup_type(ctx->registry, arg->data.named.qualified_name)))
+        if (rust_type_arg_open(ctx, t->data.template_type.template_args[i]))
             return true;
     }
     return false;
+}
+
+/* True when the impl's self type `H<..>` can be the receiver `H<..>`
+ * whatever the open arguments are: every argument of the self type is a
+ * parameter of the impl standing once. A parameter written twice
+ * (`impl<T> Tr for Pair<T, T>`) needs the receiver's arguments at those
+ * positions known and equal; a concrete argument or a parameter nested
+ * inside another type needs the receiver's argument known and equal to it.
+ * Anything else withholds. */
+static bool rust_open_arg_impl_self_fits(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                         const CBMType *recv) {
+    const CBMType *self_t =
+        rust_strip_references(rust_method_impl_self_written(ctx, method, recv));
+    if (!self_t || self_t->kind != CBM_TYPE_TEMPLATE ||
+        self_t->data.template_type.arg_count != recv->data.template_type.arg_count)
+        return false;
+    int param_count = 0;
+    while (method->rust_impl_type_params && method->rust_impl_type_params[param_count])
+        param_count++;
+    for (int i = 0; i < self_t->data.template_type.arg_count; i++) {
+        const CBMType *written = self_t->data.template_type.template_args[i];
+        const CBMType *actual = recv->data.template_type.template_args[i];
+        int param = written ? rust_receiver_param_index(ctx, written,
+                                                        method->rust_impl_type_params,
+                                                        param_count)
+                            : -1;
+        if (param < 0) {
+            if (rust_type_arg_open(ctx, actual) || !cbm_type_equal(written, actual))
+                return false;
+            continue;
+        }
+        for (int j = 0; j < i; j++) {
+            const CBMType *earlier = self_t->data.template_type.template_args[j];
+            if (!earlier || rust_receiver_param_index(ctx, earlier, method->rust_impl_type_params,
+                                                      param_count) != param)
+                continue;
+            const CBMType *earlier_actual = recv->data.template_type.template_args[j];
+            if (rust_type_arg_open(ctx, actual) || rust_type_arg_open(ctx, earlier_actual) ||
+                !cbm_type_equal(actual, earlier_actual))
+                return false;
+        }
+    }
+    return true;
 }
 
 /* `recv.m()` where `recv` is `H<..>` with an argument left open and the probe
  * cannot prove the impl's bounds. When `H` has no inherent `m` and no Deref
  * target, `m` is no std-trait name, exactly one in-scope corpus trait
  * declares `m`, and exactly one impl of that trait on `H` defines it, that
- * impl is the only candidate a compiling call can reach. A blanket or
+ * impl is the only candidate a compiling call can reach, provided its self
+ * type fits the receiver (rust_open_arg_impl_self_fits). A blanket or
  * reference impl of the trait defining `m` withholds. Assumes a nominal
  * impl on the head is chosen over the trait's blanket impls. */
 static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *ctx,
@@ -16549,7 +16597,7 @@ static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *c
             return NULL;
         selected = f;
     }
-    return selected;
+    return selected && rust_open_arg_impl_self_fits(ctx, selected, base) ? selected : NULL;
 }
 
 /* `Default::default()` (std's trait, spelled bare or through `std`/`core`)
