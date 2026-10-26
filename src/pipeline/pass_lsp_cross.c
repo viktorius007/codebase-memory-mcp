@@ -2222,6 +2222,39 @@ static bool pxc_python_load_namespace(PXCPythonResolver *pr, const cbm_gbuf_node
                                        true, depth + 1);
 }
 
+static const cbm_gbuf_node_t *pxc_python_own_node(const cbm_pipeline_ctx_t *ctx,
+                                                  const char *module_qn, const char *name);
+static bool pxc_python_binder_fits(const cbm_gbuf_node_t *node, const CBMPyNamespaceFact *fact);
+
+/* Whether a star import of the module `owner` (facts `source`) that may or
+ * may not bind `name` leaves the importer's `current` value for it in place:
+ * `current` is the module's own node for the name, and every statement of
+ * the module naming it binds that node or leaves the name (an undecorated
+ * def or class, or an OWN_OR_KEPT binder that fits it), with no star import
+ * or any-name binder in the module. Either outcome is then that node. */
+static bool pxc_python_star_keeps(const cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *owner,
+                                  const CBMPyNamespaceFacts *source, const char *name,
+                                  const char *current) {
+    const cbm_gbuf_node_t *own = owner && current && current[0]
+                                     ? pxc_python_own_node(ctx, owner->qualified_name, name)
+                                     : NULL;
+    if (!own || strcmp(current, own->qualified_name) != 0)
+        return false;
+    for (int i = 0; i < source->count; i++) {
+        const CBMPyNamespaceFact *fact = &source->items[i];
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
+            (fact->local_name && strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0))
+            return false;
+        if (!fact->local_name || strcmp(fact->local_name, name) != 0)
+            continue;
+        bool own_or_kept =
+            fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_OWN_OR_KEPT;
+        if ((fact->kind != CBM_PY_NS_OWN_DEF && !own_or_kept) || !pxc_python_binder_fits(own, fact))
+            return false;
+    }
+    return true;
+}
+
 static bool pxc_python_apply_star(PXCPythonResolver *pr, const char *rel_path, const char *file_qn,
                                   const CBMPyNamespaceFact *fact, PXCPythonImportMap *map,
                                   int depth) {
@@ -2244,11 +2277,21 @@ static bool pxc_python_apply_star(PXCPythonResolver *pr, const char *rel_path, c
         pxc_python_map_free(&exported);
         return false;
     }
+    const cbm_gbuf_node_t *owner = pxc_python_owner_module(pr->ctx->gbuf, module);
     for (int i = 0; i < exported.count; i++) {
-        const char *value = pxc_python_name_is_exported(&source, exported.keys[i], NULL, NULL)
-                                ? exported.vals[i]
-                                : NULL;
-        if (!pxc_python_map_set(map, exported.keys[i], value)) {
+        /* A name the star does not export keeps an importer binding it
+         * holds (one it does not hold stays blocked against a weaker name
+         * guess); a blocked export over the same own node proves nothing
+         * new. */
+        const char *key = exported.keys[i];
+        bool exports = pxc_python_name_is_exported(&source, key, NULL, NULL);
+        const char *value = exports ? exported.vals[i] : NULL;
+        int held = pxc_python_map_find(map, key);
+        if (held >= 0 &&
+            (!exports || ((!value || !value[0]) &&
+                          pxc_python_star_keeps(pr->ctx, owner, &source, key, map->vals[held]))))
+            continue;
+        if (!pxc_python_map_set(map, key, value)) {
             pxc_python_map_free(&exported);
             return false;
         }
