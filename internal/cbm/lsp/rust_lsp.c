@@ -19927,6 +19927,71 @@ static void rust_register_derive_impl(CBMArena *arena, CBMTypeRegistry *reg, int
     }
 }
 
+/* `#[derive(Deref)]` names no std derive; the corpus macro (bevy_derive's)
+ * expands on a type with one field to `type Target = <that field>`. A type
+ * with any other field count keeps no target: its expansion picks the field
+ * a `#[deref]` attribute marks, which the registry does not record. A generic
+ * type keeps none either: its field types are not read against its params. */
+/* Whether the attribute `attr` (`#[derive(A, path::B)]`, with or without its
+ * `#[..]`) is a derive whose argument list names `name` as a path's last
+ * segment. Any other attribute, such as a doc string quoting one, is not. */
+static bool rust_attribute_derives(const char *attr, const char *name) {
+    const char *p = attr;
+    while (*p && (isspace((unsigned char)*p) || *p == '#' || *p == '['))
+        p++;
+    if (strncmp(p, "derive", strlen("derive")) != 0)
+        return false;
+    p += strlen("derive");
+    while (isspace((unsigned char)*p))
+        p++;
+    if (*p != '(')
+        return false;
+    const char *close = strchr(++p, ')');
+    size_t len = strlen(name);
+    while (close && p < close) {
+        const char *end = p;
+        while (end < close && *end != ',')
+            end++;
+        const char *last = end;
+        while (last > p && isspace((unsigned char)last[-1]))
+            last--;
+        const char *start = last;
+        while (start > p && (isalnum((unsigned char)start[-1]) || start[-1] == '_'))
+            start--;
+        const char *lead = start;
+        while (lead > p && (lead[-1] == ':' || isspace((unsigned char)lead[-1])))
+            lead--;
+        bool path = lead == start || (start - lead >= 2 && start[-1] == ':' && start[-2] == ':');
+        if (path && (size_t)(last - start) == len && strncmp(start, name, len) == 0)
+            return true;
+        p = end + 1;
+    }
+    return false;
+}
+
+static void rust_register_derived_deref(CBMRegisteredType *rt, const char *const *decorators) {
+    bool derived = false;
+    for (int di = 0; decorators && decorators[di] && !derived; di++)
+        derived = rust_attribute_derives(decorators[di], "Deref");
+    if (!derived || rt->type_param_names) {
+        return;
+    }
+    int fields = 0;
+    while (rt->field_names && rt->field_names[fields])
+        fields++;
+    const CBMType *target = fields == 1 && rt->field_types ? rt->field_types[0] : NULL;
+    if (!target) {
+        return;
+    }
+    if (!rt->deref_target) {
+        rt->deref_target = target;
+        rt->deref_param_names = rt->type_param_names;
+    } else if (!cbm_type_equal(rt->deref_target, target)) {
+        rt->deref_target = cbm_type_unknown();
+        rt->deref_param_names = NULL;
+    }
+}
+
 /* Register the curated derives named by `#[derive(..)]` decorators on the
  * registered type at `type_index`. A derive path (`serde::Serialize`) is
  * matched on its last segment. */
@@ -20943,6 +21008,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 if (n > 0) {
                     reg->types[tix].field_names = names;
                     reg->types[tix].field_types = types;
+                    rust_register_derived_deref(&reg->types[tix],
+                                                (const char *const *)d->decorators);
                 }
             }
         }
