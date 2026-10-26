@@ -10666,6 +10666,58 @@ static const CBMRegisteredFunc *rust_method_probe_choice(
     return trait_rank >= 0 ? trait_method : reference;
 }
 
+/* The default body of `method` that `Type` (`receiver_qn`) reaches through
+ * autoref: a corpus trait declares it with a default, and an impl of that
+ * trait for `&Type` or `&mut Type` does not define it. Such an impl is seen
+ * through the methods it does define (registered on core.reference); an
+ * impl defining none is not seen, and then nothing is returned. NULL when no
+ * trait or two qualify. `*via` is a method that impl defines, of the `&Type`
+ * impl when there is one: its written reference self type ranks the autoref
+ * the call takes; either impl inherits the same declaration. */
+static const CBMRegisteredFunc *rust_reference_impl_default(RustLSPContext *ctx,
+                                                            const char *receiver_qn,
+                                                            const char *method,
+                                                            const CBMRegisteredFunc **via) {
+    const CBMRegisteredFunc *selected = NULL;
+    *via = NULL;
+    CBMTypeShortIter it;
+    cbm_registry_all_types_chain(ctx->registry, &it);
+    for (int ti; (ti = cbm_type_short_iter_next(&it)) >= 0;) {
+        const CBMRegisteredType *trait = &it.reg->types[ti];
+        if (!trait->is_interface || trait->alias_of || !trait->qualified_name)
+            continue;
+        const CBMRegisteredFunc *declared =
+            rust_lookup_method_in_trait_own(ctx, trait->qualified_name, method, false);
+        if (!declared)
+            continue;
+        const CBMRegisteredFunc *implemented = NULL;
+        bool defines = false;
+        for (const CBMTypeRegistry *reg = ctx->registry; reg && !defines; reg = reg->fallback) {
+            for (int fi = 0; fi < reg->func_count && !defines; fi++) {
+                const CBMRegisteredFunc *f = &reg->funcs[fi];
+                const CBMType *self = f->rust_reference_impl_self;
+                if (!self || self->kind != CBM_TYPE_REFERENCE || !f->impl_trait_qn ||
+                    !rust_trait_qn_same(f->impl_trait_qn, trait->qualified_name))
+                    continue;
+                const char *head = rust_method_probe_head(self->data.reference.elem);
+                if (!head || strcmp(head, receiver_qn) != 0)
+                    continue;
+                /* Autoref tries `&Type` before `&mut Type`: a shared impl ranks. */
+                if (!implemented || !self->data.reference.rust_mutable)
+                    implemented = f;
+                defines = f->short_name && strcmp(f->short_name, method) == 0;
+            }
+        }
+        if (!implemented || defines)
+            continue;
+        if (selected && strcmp(selected->qualified_name, declared->qualified_name) != 0)
+            return NULL;
+        selected = declared;
+        *via = implemented;
+    }
+    return selected;
+}
+
 /* Resolve an ordinary method call with Rust precedence: inherent first,
  * concrete trait override second (of a registered trait or, on a project
  * type, of an unregistered one), then an unambiguous trait default. */
@@ -10870,6 +10922,32 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             }
             default_trait = trait_qn;
             default_method = candidate;
+        }
+    }
+    if (!default_method && !seen_default_trait && !unregistered_method && recv) {
+        const CBMRegisteredFunc *via = NULL;
+        const CBMRegisteredFunc *by_reference =
+            rust_reference_impl_default(ctx, receiver_type_qn, method_name, &via);
+        bool proved = false;
+        if (by_reference && via &&
+            (!require_scope || !rust_trait_out_of_scope(ctx, by_reference->receiver_type,
+                                                        method_name, NULL, inh ? &proved : NULL)) &&
+            (!inh || proved)) {
+            const CBMRegisteredFunc *selected = rust_method_probe_choice(
+                ctx, inh, via, recv, method_name, require_scope, &scope_filtered, stop);
+            if (selected && selected == via) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
+                if (out_trait_dispatch)
+                    *out_trait_dispatch = true;
+                return by_reference;
+            }
+            if (selected && selected == inh) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
+                return inh;
+            }
+            return NULL;
         }
     }
     if (default_method && unregistered_method) {
