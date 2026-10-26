@@ -10404,6 +10404,11 @@ typedef struct RustMacroRule {
      * definition's own text, not this file. */
     uint32_t external_id;
     bool miss; /* external_id entry recording that no definition is inherited */
+    /* External definition named by a `use` path (path scope) rather than
+     * inherited by textual scope; `external_text` identifies it. */
+    bool path_scoped;
+    const char *external_text;
+    const char *crate_path; /* path-scoped: what `$crate` reads as at the call site */
 } RustMacroRule;
 
 /* Strip a single outer pair of matching brackets from a token-tree
@@ -10577,6 +10582,7 @@ typedef struct {
     const char *name;
     const char *text; /* the whole `macro_rules! name { .. }` item */
     uint32_t end_byte;
+    bool exported; /* `#[macro_export]`: path-scoped at its crate root */
 } RustMacroFactDef;
 
 typedef struct {
@@ -10586,12 +10592,21 @@ typedef struct {
     bool macro_use; /* `#[macro_use]` lifts the child's macros into this module */
 } RustMacroFactMod;
 
+/* A file-level `use name;` naming a single identifier: it re-exports the
+ * macro_rules! definition of `name` textually visible at `start_byte`. */
+typedef struct {
+    const char *name;
+    uint32_t start_byte;
+} RustMacroFactUse;
+
 struct CBMRustMacroFacts {
     CBMArena arena;
     RustMacroFactDef *defs;
     int def_count;
     RustMacroFactMod *mods;
     int mod_count;
+    RustMacroFactUse *uses;
+    int use_count;
 };
 
 typedef struct {
@@ -10659,9 +10674,23 @@ static bool rust_macro_facts_collect(CBMRustMacroFacts *facts, const char *sourc
     uint32_t count = ts_node_named_child_count(root);
     int def_cap = 0;
     int mod_cap = 0;
+    int use_cap = 0;
     for (uint32_t i = 0; i < count; i++) {
         TSNode item = ts_node_named_child(root, i);
         const char *kind = ts_node_type(item);
+        TSNode use_arg = strcmp(kind, "use_declaration") == 0
+                             ? ts_node_child_by_field_name(item, "argument", 8)
+                             : (TSNode){0};
+        if (!ts_node_is_null(use_arg) && strcmp(ts_node_type(use_arg), "identifier") == 0) {
+            char *use_name = cbm_node_text(&facts->arena, use_arg, source);
+            if (!use_name || !rust_macro_facts_reserve(&facts->arena, (void **)&facts->uses,
+                                                       facts->use_count, &use_cap,
+                                                       sizeof(RustMacroFactUse)))
+                return false;
+            facts->uses[facts->use_count++] =
+                (RustMacroFactUse){.name = use_name, .start_byte = ts_node_start_byte(item)};
+            continue;
+        }
         bool is_def = strcmp(kind, "macro_definition") == 0;
         bool is_mod = strcmp(kind, "mod_item") == 0 &&
                       ts_node_is_null(ts_node_child_by_field_name(item, "body", 4));
@@ -10678,7 +10707,10 @@ static bool rust_macro_facts_collect(CBMRustMacroFacts *facts, const char *sourc
                                                    sizeof(RustMacroFactDef)))
                 return false;
             facts->defs[facts->def_count++] = (RustMacroFactDef){
-                .name = name, .text = text, .end_byte = ts_node_end_byte(item)};
+                .name = name,
+                .text = text,
+                .end_byte = ts_node_end_byte(item),
+                .exported = rust_item_has_attribute(source, item, "macro_export")};
         } else {
             if (!rust_macro_facts_reserve(&facts->arena, (void **)&facts->mods, facts->mod_count,
                                           &mod_cap, sizeof(RustMacroFactMod)))
@@ -10754,13 +10786,25 @@ uint64_t cbm_rust_macro_facts_digest(const char *source, int len, TSNode root) {
         bool take_def = m >= facts->mod_count || (d < facts->def_count &&
                                                   facts->defs[d].end_byte <= facts->mods[m].start_byte);
         if (take_def) {
-            hash = rust_macro_digest_mix(hash, "D");
+            hash = rust_macro_digest_mix(hash, facts->defs[d].exported ? "X" : "D");
             hash = rust_macro_digest_mix(hash, facts->defs[d++].text);
         } else {
             const RustMacroFactMod *mod = &facts->mods[m++];
             hash = rust_macro_digest_mix(hash, mod->macro_use ? "U" : mod->has_path ? "P" : "M");
             hash = rust_macro_digest_mix(hash, mod->name);
         }
+    }
+    /* Each re-export with the number of definitions before it. */
+    for (int u = 0; u < facts->use_count; u++) {
+        int before = 0;
+        while (before < facts->def_count &&
+               facts->defs[before].end_byte <= facts->uses[u].start_byte)
+            before++;
+        char count_text[16];
+        snprintf(count_text, sizeof(count_text), "%d", before);
+        hash = rust_macro_digest_mix(hash, "R");
+        hash = rust_macro_digest_mix(hash, facts->uses[u].name);
+        hash = rust_macro_digest_mix(hash, count_text);
     }
     cbm_rust_macro_facts_free(facts);
     return hash ? hash : 1;
@@ -10920,11 +10964,57 @@ static const char *rust_inherited_macro_text(RustLSPContext *ctx, const char *na
     return NULL;
 }
 
+static int macro_consume_string(const char *s, int len, int from);
+static int macro_consume_fragment(const char *s, int len, int from, const char *frag);
+
+/* `$crate` in a transcriber names the defining crate's root. At the call
+ * site that crate is `crate_path`: `crate` for this crate's own definition,
+ * else the extern-prelude name the `use` path proved for it. The transcriber
+ * has no source site, so the rewrite moves no mapped fragment. */
+static void rust_macro_bind_crate(RustLSPContext *ctx, RustMacroRule *rule,
+                                  const char *crate_path) {
+    const char *t = rule->transcriber_text;
+    if (!t || !strstr(t, "$crate"))
+        return;
+    size_t path_len = strlen(crate_path);
+    size_t cap = (size_t)rule->transcriber_len * (path_len + 1) + 1;
+    char *out = (char *)cbm_arena_alloc(ctx->arena, cap);
+    if (!out)
+        return;
+    size_t n = 0;
+    for (int i = 0; i < rule->transcriber_len;) {
+        /* String, raw-string and char literals are copied untouched. */
+        bool word_start = i == 0 || !(isalnum((unsigned char)t[i - 1]) || t[i - 1] == '_');
+        int literal_end = word_start ? macro_consume_string(t, rule->transcriber_len, i) : i;
+        if (literal_end == i && t[i] == '\'')
+            literal_end = macro_consume_fragment(t, rule->transcriber_len, i, "literal");
+        if (literal_end > i) {
+            memcpy(out + n, t + i, (size_t)(literal_end - i));
+            n += (size_t)(literal_end - i);
+            i = literal_end;
+            continue;
+        }
+        bool at = i + 6 <= rule->transcriber_len && memcmp(t + i, "$crate", 6) == 0 &&
+                  (i + 6 == rule->transcriber_len ||
+                   !(isalnum((unsigned char)t[i + 6]) || t[i + 6] == '_'));
+        if (at) {
+            memcpy(out + n, crate_path, path_len);
+            n += path_len;
+            i += 6;
+        } else {
+            out[n++] = t[i++];
+        }
+    }
+    out[n] = '\0';
+    rule->transcriber_text = out;
+    rule->transcriber_len = (int)n;
+}
+
 /* Record the rules of the macro_rules! item `text` as one external
  * definition of `name`, or a miss when there is none, and return its first
  * rule (NULL for a miss). */
 static RustMacroRule *rust_record_external_macro(RustLSPContext *ctx, const char *name,
-                                                 const char *text) {
+                                                 const char *text, const char *crate_path) {
     int first = ctx->macro_rules_count;
     TSParser *parser = text ? ts_parser_new() : NULL;
     TSTree *tree = NULL;
@@ -10958,8 +11048,211 @@ static RustMacroRule *rust_record_external_macro(RustLSPContext *ctx, const char
     }
     for (int i = first; i < ctx->macro_rules_count; i++) {
         ctx->macro_rules_arr[i]->external_id = (uint32_t)first + 1;
+        ctx->macro_rules_arr[i]->path_scoped = crate_path != NULL;
+        ctx->macro_rules_arr[i]->external_text = text;
+        ctx->macro_rules_arr[i]->crate_path = crate_path;
+        if (crate_path)
+            rust_macro_bind_crate(ctx, ctx->macro_rules_arr[i], crate_path);
     }
     return miss ? NULL : ctx->macro_rules_arr[first];
+}
+
+/* ── macro_rules! path scope through `use` ────────────────────────
+ *
+ * A name with no textual-scope definition names a macro_rules! item only
+ * through path scope: a `#[macro_export]` definition sits at its crate root,
+ * and a `use name;` beside a definition re-exports it from that module. The
+ * invocation's name must be bound by a `use` whose path the corpus resolves
+ * to such an item; any other path (an external crate, the prelude) withholds. */
+
+/* `qn` without its last segment, or NULL. */
+static const char *module_parent_qn(RustLSPContext *ctx, const char *qn) {
+    const char *dot = strrchr(qn, '.');
+    return dot ? cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn)) : NULL;
+}
+
+/* The one `#[macro_export]` definition of `name` in the crate whose files sit
+ * under `prefix`, or NULL when none or several disagree. */
+static const char *rust_exported_macro_text(const CBMRustMacroTable *table, const char *prefix,
+                                            const char *name) {
+    size_t len = strlen(prefix);
+    const char *found = NULL;
+    for (int i = 0; i < table->count; i++) {
+        const char *file = table->entries[i].module_qn;
+        if (strncmp(file, prefix, len) != 0 || file[len] != '.')
+            continue;
+        const CBMRustMacroFacts *facts = table->entries[i].facts;
+        for (int d = 0; d < facts->def_count; d++) {
+            const RustMacroFactDef *def = &facts->defs[d];
+            if (!def->exported || strcmp(def->name, name) != 0)
+                continue;
+            if (found && strcmp(found, def->text) != 0)
+                return NULL;
+            found = def->text;
+        }
+    }
+    return found;
+}
+
+/* The definition of `name` that the module file `file` re-exports with a
+ * file-level `use name;`, or NULL. */
+static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const char *file,
+                                                   const char *name) {
+    const CBMRustMacroFacts *facts = rust_macro_table_file(ctx->imports->macros, file);
+    const char *bound =
+        facts && ctx->imports->lookup ? ctx->imports->lookup(ctx->imports->ctx, file, name) : NULL;
+    if (!bound || strcmp(bound, name) != 0)
+        return NULL;
+    /* The definition textually visible at the `use`: the last one before it.
+     * Two file-level `use name;` items would conflict (E0252). */
+    const RustMacroFactUse *reexport = NULL;
+    for (int u = 0; u < facts->use_count; u++) {
+        if (strcmp(facts->uses[u].name, name) == 0) {
+            if (reexport)
+                return NULL;
+            reexport = &facts->uses[u];
+        }
+    }
+    const RustMacroFactDef *best = NULL;
+    for (int d = 0; reexport && d < facts->def_count; d++) {
+        if (strcmp(facts->defs[d].name, name) == 0 &&
+            facts->defs[d].end_byte <= reexport->start_byte)
+            best = &facts->defs[d];
+    }
+    return best ? best->text : NULL;
+}
+
+/* The macro_rules! item that the `use` path `raw` (already resolved to the
+ * item QN `resolved` when relative) names as `name`, or NULL. */
+static bool rust_kind_is_item(const char *kind);
+
+/* Whether `node` (of the file's own tree) declares an item named `name`:
+ * a module, type, function, constant, macro or `extern crate` alias. With
+ * `written`, an item-position macro invocation counts too: it may declare
+ * one unseen. */
+static bool rust_file_declares(const RustLSPContext *ctx, TSNode node, const char *name,
+                               bool written) {
+    const char *kind = ts_node_type(node);
+    if (rust_kind_is_item(kind) && strcmp(kind, "use_declaration") != 0 &&
+        strcmp(kind, "impl_item") != 0) {
+        static const char *const fields[] = {"name", "alias"};
+        for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
+            TSNode id = ts_node_child_by_field_name(node, fields[f], (uint32_t)strlen(fields[f]));
+            size_t len = ts_node_is_null(id) ? 0 : ts_node_end_byte(id) - ts_node_start_byte(id);
+            if (len == strlen(name) &&
+                memcmp(ctx->root_source + ts_node_start_byte(id), name, len) == 0)
+                return true;
+        }
+    }
+    if (written && strcmp(kind, "macro_invocation") == 0) {
+        TSNode parent = ts_node_parent(node);
+        const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (strcmp(parent_kind, "source_file") == 0 || strcmp(parent_kind, "declaration_list") == 0)
+            return true;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_file_declares(ctx, ts_node_named_child(node, i), name, written))
+            return true;
+    }
+    return false;
+}
+
+/* Whether the invoking file binds `head` lexically, so a dependency key of
+ * that name may not be what the path means: a source `use` naming it, an
+ * item declared with it, and for a path written outside a `use` (where a
+ * local name silently shadows the extern prelude) any glob import or
+ * item-position macro invocation. In a `use` path rustc rejects an
+ * ambiguous head (E0659), so globs and macro items there cannot shadow it. */
+static bool rust_head_bound_locally(const RustLSPContext *ctx, const char *head, bool written) {
+    for (int i = 0; i < ctx->use_count; i++) {
+        if (ctx->use_raw_paths[i] && ctx->use_raw_paths[i] != ctx->use_module_paths[i] &&
+            strcmp(ctx->use_local_names[i], head) == 0)
+            return true;
+    }
+    if (written && ctx->glob_count > 0)
+        return true;
+    return ts_node_is_null(ctx->root_node) ||
+           rust_file_declares(ctx, ctx->root_node, head, written);
+}
+
+static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw,
+                                            const char *resolved, const char *name,
+                                            const char **crate_path, bool written) {
+    if (strncmp(raw, "::", 2) == 0)
+        raw += 2;
+    const char *sep = strstr(raw, "::");
+    if (!sep)
+        return NULL;
+    char *head = cbm_arena_strndup(ctx->arena, raw, (size_t)(sep - raw));
+    bool relative =
+        strcmp(head, "crate") == 0 || strcmp(head, "self") == 0 || strcmp(head, "super") == 0;
+    /* Another crate is addressable only through the invoking crate's extern
+     * prelude, whose keys are its dependency names (renamed ones included):
+     * the crate graph decides the head, never a workspace member's name. */
+    const char *extern_root =
+        !relative && ctx->imports->modtree && !rust_head_bound_locally(ctx, head, written)
+            ? cbm_rust_modtree_extern_root(ctx->imports->modtree, ctx->module_qn, head)
+            : NULL;
+    if (!relative && !extern_root)
+        return NULL; /* outside the corpus, or not a dependency of this crate */
+    const char *extern_dir = extern_root ? module_parent_qn(ctx, extern_root) : NULL;
+    const char *item = relative                ? resolved
+                       : !strstr(sep + 2, "::") ? cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                                    extern_root, sep + 2)
+                       : extern_dir             ? cbm_arena_sprintf(ctx->arena, "%s.%s", extern_dir,
+                                                        convert_path_to_qn(ctx->arena, sep + 2))
+                                                : NULL;
+    const char *dot = item ? strrchr(item, '.') : NULL;
+    if (!dot || strcmp(dot + 1, name) != 0)
+        return NULL;
+    const char *module = cbm_arena_strndup(ctx->arena, item, (size_t)(dot - item));
+    const char *exported = NULL;
+    if (strcmp(sep + 2, name) == 0 && (extern_dir || strcmp(head, "crate") == 0)) {
+        const char *prefix = extern_dir ? extern_dir : rust_crate_root_prefix(ctx);
+        exported = prefix ? rust_exported_macro_text(ctx->imports->macros, prefix, name) : NULL;
+    }
+    const char *reexported = NULL;
+    static const char *const files[] = {"", ".mod", ".lib", ".main"};
+    for (size_t k = 0; module && k < sizeof(files) / sizeof(files[0]); k++) {
+        const char *file = cbm_arena_sprintf(ctx->arena, "%s%s", module, files[k]);
+        const char *text = file ? rust_reexported_macro_file_text(ctx, file, name) : NULL;
+        if (text && reexported && strcmp(text, reexported) != 0)
+            return NULL;
+        reexported = text ? text : reexported;
+    }
+    if (exported && reexported && strcmp(exported, reexported) != 0)
+        return NULL;
+    *crate_path = relative ? "crate" : head;
+    return exported ? exported : reexported;
+}
+
+/* The macro_rules! item an invocation of `macro_name` names through path
+ * scope: the written path, or the innermost `use` binding its single
+ * segment. */
+static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               const char **crate_path) {
+    if (strstr(macro_name, "::")) {
+        bool relative = strncmp(macro_name, "crate::", 7) == 0 ||
+                        strncmp(macro_name, "self::", 6) == 0 ||
+                        strncmp(macro_name, "super::", 7) == 0;
+        return rust_use_path_macro_text(ctx, macro_name,
+                                        relative ? rust_resolve_path_expr(ctx, macro_name) : NULL,
+                                        strrchr(macro_name, ':') + 1, crate_path, true);
+    }
+    /* Block `use`s follow the file's, so the last source binding is the
+     * innermost; it alone decides, and one the corpus cannot read withholds.
+     * Graph-import entries carry no raw path of their own and are skipped. */
+    for (int i = ctx->use_count - 1; i >= 0; i--) {
+        const char *raw = ctx->use_raw_paths[i];
+        if (strcmp(ctx->use_local_names[i], macro_name) != 0 || !raw ||
+            raw == ctx->use_module_paths[i])
+            continue;
+        const char *leaf = strrchr(raw, ':');
+        return rust_use_path_macro_text(ctx, raw, ctx->use_module_paths[i],
+                                        leaf ? leaf + 1 : raw, crate_path, false);
+    }
+    return NULL;
 }
 
 /* The definition an invocation of `macro_name` expands: the file's own
@@ -10967,16 +11260,37 @@ static RustMacroRule *rust_record_external_macro(RustLSPContext *ctx, const char
 static RustMacroRule *rust_macro_definition_for(RustLSPContext *ctx, const char *macro_name,
                                                 TSNode invocation) {
     RustMacroRule *local = rust_visible_macro_definition(ctx, macro_name, invocation);
-    if (local || !ctx || !macro_name || strchr(macro_name, ':') || !ctx->imports ||
-        !ctx->imports->macros)
+    if (local || !ctx || !macro_name || !ctx->imports || !ctx->imports->macros)
         return local;
+    RustMacroRule *inherited = NULL;
+    bool cached = strchr(macro_name, ':') != NULL; /* a path has no textual scope */
+    for (int i = 0; i < ctx->macro_rules_count && !cached; i++) {
+        RustMacroRule *rule = ctx->macro_rules_arr[i];
+        if (rule->external_id && !rule->path_scoped && rule->macro_name &&
+            strcmp(rule->macro_name, macro_name) == 0) {
+            inherited = rule->miss ? NULL : rule;
+            cached = true;
+        }
+    }
+    if (!cached)
+        inherited = rust_record_external_macro(ctx, macro_name,
+                                               rust_inherited_macro_text(ctx, macro_name), NULL);
+    if (inherited)
+        return inherited;
+    /* The `use` bindings in scope differ between invocations, so the path
+     * is resolved each time and only the parsed definition is shared. */
+    const char *crate_path = NULL;
+    const char *text = rust_path_scoped_macro_text(ctx, macro_name, &crate_path);
+    if (!text)
+        return NULL;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
         RustMacroRule *rule = ctx->macro_rules_arr[i];
-        if (rule->external_id && rule->macro_name && strcmp(rule->macro_name, macro_name) == 0)
+        if (rule->path_scoped && rule->external_text == text && rule->macro_name &&
+            strcmp(rule->macro_name, macro_name) == 0 && crate_path &&
+            strcmp(rule->crate_path, crate_path) == 0)
             return rule->miss ? NULL : rule;
     }
-    return rust_record_external_macro(ctx, macro_name,
-                                      rust_inherited_macro_text(ctx, macro_name));
+    return crate_path ? rust_record_external_macro(ctx, macro_name, text, crate_path) : NULL;
 }
 
 static bool rust_has_visible_macro_definition(RustLSPContext *ctx, const char *macro_name,
@@ -11139,6 +11453,81 @@ static int macro_consume_balanced(const char *s, int len, int from) {
 
 /* Consume a fragment from the input matching the given fragment kind.
  * Returns end position or `from` if the consumption failed. */
+/* End of the one numeric literal token starting with the digit at `p`:
+ * digits and underscores (hex, octal, binary after `0x`/`0o`/`0b`), a
+ * fractional part when `.` is followed by a digit, or a bare trailing `.`
+ * when it is followed by neither `.` nor an identifier start (a letter, `_`
+ * or any non-ASCII byte; `1.` is a
+ * float, `1..2` a range, `1.f()` a method call), an exponent whose digits
+ * may follow underscores (`1e+_2`), then an optional suffix. */
+static int macro_consume_number(const char *s, int len, int p) {
+    if (p + 1 < len && s[p] == '0' && (s[p + 1] == 'x' || s[p + 1] == 'o' || s[p + 1] == 'b')) {
+        p += 2;
+        while (p < len && (isxdigit((unsigned char)s[p]) || s[p] == '_'))
+            p++;
+    } else {
+        while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+            p++;
+        if (p + 1 < len && s[p] == '.' && isdigit((unsigned char)s[p + 1])) {
+            p++;
+            while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+                p++;
+        } else if (p < len && s[p] == '.' &&
+                   (p + 1 >= len ||
+                    !(s[p + 1] == '.' || s[p + 1] == '_' || isalpha((unsigned char)s[p + 1]) ||
+                      (unsigned char)s[p + 1] >= 0x80))) {
+            return p + 1; /* `1.`: a float with no fraction takes no suffix */
+        }
+        if (p < len && (s[p] == 'e' || s[p] == 'E')) {
+            int q = p + 1;
+            if (q < len && (s[q] == '+' || s[q] == '-'))
+                q++;
+            while (q < len && s[q] == '_')
+                q++;
+            if (q < len && isdigit((unsigned char)s[q])) {
+                p = q;
+                while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+                    p++;
+            }
+        }
+    }
+    if (p < len && (isalpha((unsigned char)s[p]) || s[p] == '_'))
+        p = macro_consume_ident(s, len, p);
+    return p;
+}
+
+/* End of the string literal token at `from` (`"…"`, `b"…"`, `c"…"`, raw
+ * `r#"…"#` and `br"…"`), or `from` when none starts there. */
+static int macro_consume_string(const char *s, int len, int from) {
+    int p = from;
+    if (p < len && (s[p] == 'b' || s[p] == 'c'))
+        p++;
+    bool raw = p < len && s[p] == 'r';
+    if (raw)
+        p++;
+    int hashes = 0;
+    while (raw && p < len && s[p] == '#') {
+        hashes++;
+        p++;
+    }
+    if (p >= len || s[p] != '"')
+        return from;
+    for (p++; p < len; p++) {
+        if (!raw && s[p] == '\\') {
+            p++;
+            continue;
+        }
+        if (s[p] != '"')
+            continue;
+        int h = 0;
+        while (h < hashes && p + 1 + h < len && s[p + 1 + h] == '#')
+            h++;
+        if (h == hashes)
+            return p + 1 + hashes;
+    }
+    return from;
+}
+
 static int macro_consume_fragment(const char *s, int len, int from, const char *frag) {
     from = macro_skip_ws(s, len, from);
     if (from >= len)
@@ -11152,8 +11541,13 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
     if (strcmp(frag, "literal") == 0) {
         /* Numeric, string, char, bool literal. */
         char c = s[from];
-        if (c == '"')
-            return macro_consume_balanced(s, len, from);
+        int string_end = macro_consume_string(s, len, from);
+        if (string_end > from)
+            return string_end;
+        if (c == 'b' && from + 1 < len && s[from + 1] == '\'') {
+            int q = macro_consume_fragment(s, len, from + 1, "literal");
+            return q > from + 1 ? q : from;
+        }
         if (c == '\'') {
             int q = from + 1;
             if (q < len && s[q] == '\\') {
@@ -11169,16 +11563,18 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         if (c == '-' || (c >= '0' && c <= '9')) {
             int p = from;
             if (c == '-')
-                p++;
-            while (p < len && ((s[p] >= '0' && s[p] <= '9') || s[p] == '_' || s[p] == '.' ||
-                               s[p] == 'x' || s[p] == 'X' || s[p] == 'b' || s[p] == 'o' ||
-                               (s[p] >= 'a' && s[p] <= 'f') || (s[p] >= 'A' && s[p] <= 'F')))
-                p++;
-            /* Allow type suffix. */
-            int after = macro_consume_ident(s, len, p);
-            return after;
+                p = macro_skip_ws(s, len, p + 1);
+            if (p >= len || !isdigit((unsigned char)s[p]))
+                return from; /* `-` alone is no literal */
+            return macro_consume_number(s, len, p);
         }
-        return macro_consume_ident(s, len, from);
+        /* Of the identifier-shaped tokens only `true` and `false` are
+         * literals; any other identifier leaves this arm for the next. */
+        int word_end = macro_consume_ident(s, len, from);
+        if ((word_end - from == 4 && memcmp(s + from, "true", 4) == 0) ||
+            (word_end - from == 5 && memcmp(s + from, "false", 5) == 0))
+            return word_end;
+        return from;
     }
     if (strcmp(frag, "tt") == 0) {
         char c = s[from];
@@ -11186,6 +11582,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             return macro_consume_balanced(s, len, from);
         }
         /* Single token: identifier, literal, or single-char punct. */
+        int string_end = macro_consume_string(s, len, from);
+        if (string_end > from)
+            return string_end;
         if (c == '"' || c == '\'') {
             return macro_consume_fragment(s, len, from, "literal");
         }
@@ -11214,6 +11613,11 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
     int p = from;
     while (p < len) {
         char c = s[p];
+        int string_end = macro_consume_string(s, len, p);
+        if (string_end > p) {
+            p = string_end;
+            continue;
+        }
         if (c == '"' || c == '\'') {
             int q = macro_consume_fragment(s, len, p, "literal");
             if (q == p) {
@@ -11996,11 +12400,270 @@ char *cbm_rust_expand_local_item_macro(CBMArena *arena, const char *source, TSNo
     return expanded;
 }
 
-static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
+static bool macro_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Whether the identifier token `w` (`n` bytes) occurs in `s`. */
+static bool macro_text_has_ident(const char *s, int len, const char *w, int n) {
+    for (int i = 0; i + n <= len; i++) {
+        if (memcmp(s + i, w, (size_t)n) == 0 && (i == 0 || !macro_ident_char(s[i - 1])) &&
+            (i + n == len || !macro_ident_char(s[i + n])))
+            return true;
+    }
+    return false;
+}
+
+/* Whether the node's bytes all come from a fragment captured at the call
+ * site (a mapped window of the expansion), not from the transcriber. */
+static bool rust_node_captured(const RustLSPContext *ctx, TSNode node) {
+    uint32_t start = 0;
+    uint32_t end = 0;
+    return rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node), &start,
+                                 &end);
+}
+
+/* Names the transcriber binds in the current scope, as byte ranges of the
+ * expansion source. `all`: a binder set too large or unknown (an item, a
+ * pattern-taking macro), which any captured name may hit. */
+typedef struct {
+    uint32_t start[32];
+    uint32_t len[32];
+    int count;
+    bool all;
+    bool withhold; /* a captured fragment stands in a binding position */
+} RustBinders;
+
+/* Nesting bound of the hygiene traversal; deeper expansions withhold. */
+enum { RUST_HYGIENE_MAX_DEPTH = 64 };
+
+/* Add the identifiers of a transcriber-written pattern to `b`. Variant and
+ * path identifiers are added too (conservative). */
+static bool rust_node_names(TSNode node, int depth);
+
+static void rust_pattern_binders(const RustLSPContext *ctx, TSNode pattern, RustBinders *b,
+                                 int depth) {
+    if (ts_node_is_null(pattern))
+        return;
+    if (depth > RUST_HYGIENE_MAX_DEPTH) {
+        b->withhold = true;
+        return;
+    }
+    if (rust_node_captured(ctx, pattern)) {
+        /* A call-site fragment in a binding position binds a call-site name
+         * the one-scope walk would see from the transcriber's code. */
+        b->withhold |= rust_node_names(pattern, depth);
+        return;
+    }
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "shorthand_field_identifier") == 0) {
+        if (b->count == 32) {
+            b->all = true;
+            return;
+        }
+        b->start[b->count] = ts_node_start_byte(pattern);
+        b->len[b->count] = ts_node_end_byte(pattern) - ts_node_start_byte(pattern);
+        b->count++;
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(pattern);
+    for (uint32_t i = 0; i < count; i++)
+        rust_pattern_binders(ctx, ts_node_named_child(pattern, i), b, depth + 1);
+}
+
+static bool rust_kind_is_item(const char *kind) {
+    static const char *const items[] = {
+        "function_item", "const_item",     "static_item", "struct_item",
+        "enum_item",     "union_item",     "mod_item",    "use_declaration",
+        "impl_item",     "trait_item",     "type_item",   "macro_definition",
+        "extern_crate_declaration", "foreign_mod_item"};
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        if (strcmp(kind, items[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool rust_pattern_macro(const char *name) {
+    const char *leaf = strrchr(name, ':');
+    leaf = leaf ? leaf + 1 : name;
+    return strcmp(leaf, "matches") == 0 || strcmp(leaf, "assert_matches") == 0 ||
+           strcmp(leaf, "debug_assert_matches") == 0 || strcmp(leaf, "select") == 0;
+}
+
+static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
+                                      const RustBinders *bound, int depth);
+
+/* Whether a node holds a name (a literal holds none). */
+static bool rust_node_names(TSNode node, int depth) {
+    const char *kind = ts_node_type(node);
+    if (depth > RUST_HYGIENE_MAX_DEPTH || strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_field_identifier") == 0 || strcmp(kind, "metavariable") == 0 ||
+        strcmp(kind, "ERROR") == 0)
+        return true;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_node_names(ts_node_named_child(node, i), depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* Whether a captured node names an identifier that a binder in `b` binds
+ * (any name at all when `b->all`). Literals name nothing. */
+static bool rust_capture_hits(const RustLSPContext *ctx, TSNode node, const RustBinders *b,
+                              int depth) {
+    if (depth > RUST_HYGIENE_MAX_DEPTH)
+        return true;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "metavariable") == 0 ||
+        strcmp(kind, "ERROR") == 0) {
+        if (b->all || strcmp(kind, "identifier") != 0)
+            return b->all || b->count > 0;
+        uint32_t start = ts_node_start_byte(node);
+        uint32_t len = ts_node_end_byte(node) - start;
+        for (int i = 0; i < b->count; i++) {
+            if (b->len[i] == len && memcmp(ctx->source + b->start[i], ctx->source + start, len) == 0)
+                return true;
+        }
+        return false;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_capture_hits(ctx, ts_node_named_child(node, i), b, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* Binders of a transcriber `let` pattern inside a condition (if let,
+ * while let, let chains). */
+static void rust_condition_binders(const RustLSPContext *ctx, TSNode node, RustBinders *b,
+                                   int depth) {
+    if (ts_node_is_null(node) || rust_node_captured(ctx, node))
+        return;
+    if (depth > RUST_HYGIENE_MAX_DEPTH) {
+        b->withhold = true;
+        return;
+    }
+    if (strcmp(ts_node_type(node), "let_condition") == 0) {
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), b, depth + 1);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++)
+        rust_condition_binders(ctx, ts_node_named_child(node, i), b, depth + 1);
+}
+
+static bool rust_children_under_binder(const RustLSPContext *ctx, TSNode node,
+                                       const RustBinders *bound, int depth) {
+    if (bound->withhold)
+        return true;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_capture_under_binder(ctx, ts_node_named_child(node, i), bound, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* macro_rules! hygiene: a captured fragment resolves in the caller's scope
+ * only. The expansion is walked in one scope, so it may be walked only when
+ * no captured fragment names an identifier that a transcriber binder in
+ * scope at that fragment binds: then no captured name can resolve to a
+ * transcriber binder, nor be shadowed by one. Binders are the identifiers
+ * of transcriber-written patterns (`let`: the following statements of its
+ * block; match arm: its guard and value; closure parameters: the body;
+ * `for`: the body; `if let`/`while let`/let chains: the whole construct).
+ * An item declared in a block or a pattern-taking macro binds unknown
+ * names, so any named capture in its scope hits. True: withhold. */
+static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
+                                      const RustBinders *bound, int depth) {
+    if (ts_node_is_null(node))
+        return false;
+    if (depth > RUST_HYGIENE_MAX_DEPTH || bound->withhold)
+        return true;
+    if (rust_node_captured(ctx, node))
+        return rust_capture_hits(ctx, node, bound, depth);
+    const char *kind = ts_node_type(node);
+    RustBinders inner = *bound;
+    if (strcmp(kind, "block") == 0 || strcmp(kind, "source_file") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count && !inner.all; i++)
+            inner.all = rust_kind_is_item(ts_node_type(ts_node_named_child(node, i)));
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (rust_capture_under_binder(ctx, child, &inner, depth + 1))
+                return true;
+            if (strcmp(ts_node_type(child), "let_declaration") == 0)
+                rust_pattern_binders(ctx, ts_node_child_by_field_name(child, "pattern", 7),
+                                     &inner, depth + 1);
+            if (inner.withhold)
+                return true;
+        }
+        return false;
+    }
+    if (rust_kind_is_item(kind)) {
+        inner.all = true;
+        return rust_children_under_binder(ctx, node, &inner, depth);
+    }
+    if (strcmp(kind, "closure_expression") == 0) {
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "parameters", 10), &inner,
+                             depth + 1);
+        return rust_children_under_binder(ctx, node, &inner, depth);
+    }
+    if (strcmp(kind, "match_arm") == 0) {
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner,
+                             depth + 1);
+        return rust_children_under_binder(ctx, node, &inner, depth);
+    }
+    if (strcmp(kind, "for_expression") == 0) {
+        if (rust_capture_under_binder(ctx, ts_node_child_by_field_name(node, "value", 5), bound,
+                                      depth + 1))
+            return true;
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner,
+                             depth + 1);
+        return rust_capture_under_binder(ctx, ts_node_child_by_field_name(node, "body", 4),
+                                         &inner, depth + 1);
+    }
+    if (strcmp(kind, "if_expression") == 0 || strcmp(kind, "while_expression") == 0) {
+        /* The `let` binders reach the condition and the body, not `else`. */
+        rust_condition_binders(ctx, ts_node_child_by_field_name(node, "condition", 9), &inner,
+                               depth + 1);
+        static const char *const scoped[] = {"condition", "consequence", "body"};
+        for (size_t f = 0; f < sizeof(scoped) / sizeof(scoped[0]); f++) {
+            TSNode part = ts_node_child_by_field_name(node, scoped[f], (uint32_t)strlen(scoped[f]));
+            if (rust_capture_under_binder(ctx, part, &inner, depth + 1))
+                return true;
+        }
+        return rust_capture_under_binder(
+            ctx, ts_node_child_by_field_name(node, "alternative", 11), bound, depth + 1);
+    }
+    if (strcmp(kind, "macro_invocation") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "macro", 5);
+        uint32_t len = ts_node_is_null(name) ? 0 : ts_node_end_byte(name) - ts_node_start_byte(name);
+        char text[64];
+        if (len > 0 && len < sizeof(text)) {
+            memcpy(text, ctx->source + ts_node_start_byte(name), len);
+            text[len] = '\0';
+            if (rust_pattern_macro(text)) {
+                inner.all = true;
+                return rust_children_under_binder(ctx, node, &inner, depth);
+            }
+        }
+    }
+    return rust_children_under_binder(ctx, node, bound, depth);
+}
+
+/* Whether the expansion of `mname` at `invocation` was walked. False when no
+ * rule applies or a capture sits under a transcriber binder
+ * (rust_capture_under_binder): the
+ * caller then discloses the argument tokens' calls as unproven. */
+static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname)
-        return;
+        return false;
     if (ctx->macro_expand_depth >= 8)
-        return;
+        return false;
 
     RustMacroRule *hit = NULL;
     const char *inv_args = NULL;
@@ -12009,12 +12672,12 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     MacroEnv *env = rust_macro_bind_invocation(ctx, mname, invocation, &hit, &inv_args,
                                                &inv_args_len, &inv_src_start);
     if (!env)
-        return;
+        return false;
 
     if (hit->transcriber_len == 0) {
         cbm_free(CBM_MEM_CLASS_OTHER, env);
         rust_filter_discarded_macro_arguments(ctx, invocation);
-        return;
+        return true;
     }
 
     RustSiteWindows input = {.arena = ctx->arena}, outside = {.arena = ctx->arena};
@@ -12039,7 +12702,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
                                          env, &sites, (uint32_t)strlen(expand_prefix));
     cbm_free(CBM_MEM_CLASS_OTHER, env);
     if (!substituted)
-        return;
+        return true; /* the matched rule cannot transcribe: rustc rejects it */
 
     /* Expansion memo (see RustLSPContext.macro_memo): reset per top-level
      * invocation, dedup identical (macro, substituted body) within the
@@ -12051,19 +12714,20 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     uint64_t mm_key = cbm_negmemo_key(3, mname, substituted);
     if (cbm_negmemo_contains(&ctx->macro_memo, mm_key)) {
-        return;
+        return true;
     }
     cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, mm_key);
 
     /* Wrap and parse. */
     char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s; }\n", expand_prefix, substituted);
     if (!wrapped)
-        return;
+        return false;
 
     TSParser *parser = ts_parser_new();
     if (!parser)
-        return;
+        return false;
     ts_parser_set_language(parser, tree_sitter_rust());
+    bool walked = true;
     TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
     if (tree) {
         ctx->macro_expand_depth++;
@@ -12095,10 +12759,15 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             ctx->site_window_count = windows.count;
             ctx->emit_site_start_byte = 0;
             ctx->emit_site_end_byte = 0;
+            RustBinders none = {.count = 0};
+            bool hygienic = !rust_capture_under_binder(ctx, body, &none, 0);
+            walked = walked && hygienic;
             ctx->inject_syn_calls++;
-            rust_filter_macro_usages(ctx, &input, &outside, body, 0, 0);
-            rust_prove_macro_usages(ctx, body);
-            rust_resolve_calls_in_node(ctx, body);
+            if (hygienic) {
+                rust_filter_macro_usages(ctx, &input, &outside, body, 0, 0);
+                rust_prove_macro_usages(ctx, body);
+                rust_resolve_calls_in_node(ctx, body);
+            }
             ctx->inject_syn_calls--;
             ctx->source = saved_source;
             ctx->source_len = saved_len;
@@ -12112,6 +12781,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         ts_tree_delete(tree);
     }
     ts_parser_delete(parser);
+    return walked;
 }
 
 /* Re-parse the arguments of a built-in macro whose arguments are ordinary Rust
@@ -16208,8 +16878,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                  * macros with the same name. Do this before applying any
                  * built-in argument grammar or canonical std path. */
                 if (rust_has_visible_macro_definition(ctx, mname, node)) {
-                    args_proven = true;
-                    rust_expand_user_macro(ctx, mname, node);
+                    args_proven = rust_expand_user_macro(ctx, mname, node);
                 } else {
                     /* For known std macros emit a synthetic call under their
                      * canonical paths so trace tools can see the dependency. */

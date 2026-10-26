@@ -130,6 +130,12 @@ bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn
 bool cbm_rust_modtree_extern_outside(const CBMRustModTree *tree, const char *module_qn,
                                      const char *name);
 
+/* Graph module QN of the project library root file that `name` denotes in the
+ * extern prelude of every crate compiling the file `module_qn`; NULL when the
+ * name is no project library there, or when those crates disagree. */
+const char *cbm_rust_modtree_extern_root(const CBMRustModTree *tree, const char *module_qn,
+                                         const char *name);
+
 /* Whether every module of the file `caller_qn` lies outside every module of
  * the file `owner_qn`, in every crate that compiles the caller: no module of
  * the owner file is the caller's module or one of its ancestors. That is when

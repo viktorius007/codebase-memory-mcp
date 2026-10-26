@@ -1,0 +1,1 @@
+Written for lane rs-macro: path-scoped macro_rules! (`#[macro_export]` from a workspace dependency, a qualified invocation, and a `use` re-export); calls in macro arguments print their backtrace (the run is the truth).
