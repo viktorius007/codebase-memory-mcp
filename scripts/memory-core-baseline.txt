@@ -67,7 +67,7 @@ src/pipeline/pass_githistory.c	27
 src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	6
-src/pipeline/pass_lsp_cross.c	25
+src/pipeline/pass_lsp_cross.c	24
 src/pipeline/pass_parallel.c	30
 src/pipeline/pass_pkgmap.c	70
 src/pipeline/pass_semantic.c	3
