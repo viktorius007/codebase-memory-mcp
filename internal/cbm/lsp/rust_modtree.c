@@ -114,18 +114,21 @@ typedef struct {
     uint8_t prelude_restrictions;
 } RmtFile;
 
-/* `type name = value;` written in `impl Trait for SelfPath { .. }` of a
- * module, for an impl that declares no type or const parameters. `self_qn`
- * is the project type SelfPath names, filled when the tree is finished;
- * `ambiguous` marks the first entry of a key that another entry gives a
- * different value. */
+/* `type name = value;` written in `impl Trait for Self { .. }` of a module,
+ * whose self type is a path. `self_qn` is the project type the path names,
+ * filled when the tree is finished; `next` chains the entries of one
+ * (self QN, name) key. `unreadable` marks an impl with type or const
+ * parameters, or an associated type declared with type parameters: what it
+ * writes depends on bindings this record does not carry. */
 typedef struct {
     int module;
-    const char *self_path;
+    const char *self_path; /* the self type's path, without arguments */
+    const char *self_text; /* the self type as written, arguments included */
     const char *name;
     const char *value;
     const char *self_qn;
-    bool ambiguous;
+    bool unreadable;
+    int next;
 } RmtImplAssoc;
 
 /* Read-only lookup over a finished tree for trait-in-scope queries. `bound`
@@ -625,6 +628,8 @@ typedef struct {
      * `all(..)`, NULL when another attribute (cfg_attr) also gates it */
     const char *cfg;
     const char *self_path; /* RMF_IMPL_ASSOC: the impl's self type path, without arguments */
+    const char *self_text; /* RMF_IMPL_ASSOC: the impl's self type as written */
+    bool unreadable;       /* RMF_IMPL_ASSOC: the value depends on unrecorded parameters */
 } RmfRecord;
 
 struct CBMRustModFacts {
@@ -1008,16 +1013,27 @@ static TSNode rmf_impl_self_path(TSNode impl) {
                ? self : none;
 }
 
-/* Each `type name = value;` of a trait impl without type parameters whose
- * self type is a path. */
+/* True when a `type` item of an impl declares a type or const parameter of
+ * its own (a generic associated type). */
+static bool rmf_assoc_has_type_params(TSNode member) {
+    return rmf_impl_has_type_params(member);
+}
+
+/* Each `type name = value;` of a trait impl whose self type is a path. An
+ * impl with type or const parameters, or a generic associated type, is
+ * recorded unreadable: it still competes with every other impl that writes
+ * the same name on that self type. */
 static void rmf_scan_impl(RmfScan *scan, TSNode impl) {
     TSNode body = ts_node_child_by_field_name(impl, "body", 4);
     TSNode self = rmf_impl_self_path(impl);
     if (ts_node_is_null(body) || ts_node_is_null(self) ||
-        ts_node_is_null(ts_node_child_by_field_name(impl, "trait", 5)) ||
-        rmf_impl_has_type_params(impl))
+        ts_node_is_null(ts_node_child_by_field_name(impl, "trait", 5)))
         return;
+    bool generic_impl = rmf_impl_has_type_params(impl);
     const char *self_path = cbm_node_text(&scan->facts->arena, self, scan->source);
+    const char *self_text = cbm_node_text(&scan->facts->arena,
+                                          ts_node_child_by_field_name(impl, "type", 4),
+                                          scan->source);
     uint32_t count = ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count && !scan->failed; i++) {
         TSNode member = ts_node_named_child(body, i);
@@ -1029,6 +1045,8 @@ static void rmf_scan_impl(RmfScan *scan, TSNode impl) {
             continue;
         rmf_push(scan, (RmfRecord){.op = RMF_IMPL_ASSOC,
                                    .self_path = self_path,
+                                   .self_text = self_text,
+                                   .unreadable = generic_impl || rmf_assoc_has_type_params(member),
                                    .name = cbm_node_text(&scan->facts->arena, name, scan->source),
                                    .text = cbm_node_text(&scan->facts->arena, value,
                                                          scan->source)});
@@ -1376,6 +1394,9 @@ static int rmt_add_impl_assoc(CBMRustModTree *tree, int module, const RmfRecord 
     tree->impl_assocs[tree->impl_assoc_count++] = (RmtImplAssoc){
         .module = module,
         .self_path = cbm_arena_strdup(&tree->arena, record->self_path),
+        .self_text = cbm_arena_strdup(&tree->arena, record->self_text),
+        .unreadable = record->unreadable,
+        .next = -1,
         .name = cbm_arena_strdup(&tree->arena, record->name),
         .value = cbm_arena_strdup(&tree->arena, record->text)};
     return 0;
@@ -2996,9 +3017,8 @@ int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, cons
 
 /* ── Associated types of trait impls ──────────────────────────────── */
 
-/* Resolve every impl's self path in its module and index the entries by
- * (self QN, name). A key two entries give different values (cfg twins, two
- * traits declaring the same associated name) is ambiguous. */
+/* Resolve every impl's self path in its module and chain the entries of
+ * each (self QN, name) key. */
 static void rmt_impl_assoc_index_build(CBMRustModTree *tree) {
     for (int i = 0; i < tree->impl_assoc_count; i++) {
         RmtImplAssoc *entry = &tree->impl_assocs[i];
@@ -3013,23 +3033,27 @@ static void rmt_impl_assoc_index_build(CBMRustModTree *tree) {
             cbm_idxmemo_put_if_absent(&tree->impl_assoc_by_self, &tree->arena, key, i);
             continue;
         }
-        RmtImplAssoc *seen = &tree->impl_assocs[first];
-        if (strcmp(seen->value, entry->value) != 0 ||
-            strcmp(tree->modules[seen->module].qn, tree->modules[entry->module].qn) != 0)
-            seen->ambiguous = true;
+        entry->next = tree->impl_assocs[first].next;
+        tree->impl_assocs[first].next = i;
     }
 }
 
-const char *cbm_rust_modtree_impl_assoc_type(const CBMRustModTree *tree, CBMArena *arena,
-                                             const char *self_qn, const char *name,
-                                             const char **out_module_qn) {
+int cbm_rust_modtree_impl_assocs(const CBMRustModTree *tree, CBMArena *arena,
+                                 const char *self_qn, const char *name, CBMRustImplAssoc *out,
+                                 int max) {
     if (!tree || !self_qn || !name)
-        return NULL;
+        return 0;
     const char *key = cbm_arena_sprintf(arena, "%s\x1f%s", self_qn, name);
-    int32_t at = key ? cbm_idxmemo_get(&tree->impl_assoc_by_self, key) : -1;
-    if (at < 0 || tree->impl_assocs[at].ambiguous)
-        return NULL;
-    if (out_module_qn)
-        *out_module_qn = tree->modules[tree->impl_assocs[at].module].qn;
-    return tree->impl_assocs[at].value;
+    int count = 0;
+    for (int at = key ? cbm_idxmemo_get(&tree->impl_assoc_by_self, key) : -1; at >= 0;
+         at = tree->impl_assocs[at].next) {
+        if (count == max)
+            return -1;
+        const RmtImplAssoc *entry = &tree->impl_assocs[at];
+        out[count++] = (CBMRustImplAssoc){.self_text = entry->self_text,
+                                          .value = entry->value,
+                                          .module_qn = tree->modules[entry->module].qn,
+                                          .unreadable = entry->unreadable};
+    }
+    return count;
 }

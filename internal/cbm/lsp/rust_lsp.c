@@ -7194,11 +7194,30 @@ static const char *rust_projection_name(const CBMType *t, const char **head, siz
     return dot + 1;
 }
 
+enum { RUST_IMPL_ASSOC_MAX = 16 };
+
+/* True when the impl self type `written` (read in the impl's module) is the
+ * type `bound`: a self type written with arguments must equal `bound`
+ * exactly; one written without them takes a bound type without arguments. */
+static bool rust_impl_assoc_self_fits(const CBMType *written, const CBMType *bound) {
+    if (!written || !bound) {
+        return false;
+    }
+    if (written->kind == CBM_TYPE_TEMPLATE && written->data.template_type.arg_count > 0) {
+        return cbm_type_equal(written, bound);
+    }
+    return bound->kind == CBM_TYPE_NAMED ||
+           (bound->kind == CBM_TYPE_TEMPLATE && bound->data.template_type.arg_count == 0);
+}
+
 /* `<self_t as Trait>::name` read through the project's trait impls for
  * self_t's type: the type their `type name = V;` writes, resolved where the
- * impl stands. NULL when self_t is no project type the tree knows (a
- * reference, a parameter, a std type), or no impl, or two impls with
- * different values, write it. */
+ * impl stands, with `Self` read as the impl's own self type. NULL when
+ * self_t is no project type (a reference, a parameter, a std type), when no
+ * impl whose self type is exactly self_t writes it, when two such impls write
+ * different values, or when any impl of the name on that type is generic or
+ * declares a generic associated type (the trait bounding the parameter is
+ * not known here, so such an impl may be the one selected). */
 static const CBMType *rust_project_impl_assoc(RustLSPContext *ctx, const CBMType *self_t,
                                               const char *name) {
     const char *self_qn = !self_t                            ? NULL
@@ -7206,15 +7225,32 @@ static const CBMType *rust_project_impl_assoc(RustLSPContext *ctx, const CBMType
                           : self_t->kind == CBM_TYPE_TEMPLATE ? self_t->data.template_type.template_name
                                                               : NULL;
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
-    const char *module = NULL;
-    const char *value = self_qn && tree ? cbm_rust_modtree_impl_assoc_type(
-                                              tree, ctx->arena, self_qn, name, &module)
-                                             : NULL;
-    if (!value) {
-        return NULL;
+    CBMRustImplAssoc found[RUST_IMPL_ASSOC_MAX];
+    int count = self_qn && tree ? cbm_rust_modtree_impl_assocs(tree, ctx->arena, self_qn, name,
+                                                               found, RUST_IMPL_ASSOC_MAX)
+                                : 0;
+    const CBMType *result = NULL;
+    for (int i = 0; i < count; i++) {
+        if (found[i].unreadable) {
+            return NULL;
+        }
+        const CBMType *written =
+            rust_parse_def_type_text(ctx->arena, found[i].self_text, found[i].module_qn, tree);
+        if (!rust_impl_assoc_self_fits(written, self_t)) {
+            continue;
+        }
+        if (strstr(found[i].value, "Self::")) {
+            return NULL;
+        }
+        const CBMType *value =
+            rust_parse_def_type_text(ctx->arena, found[i].value, found[i].module_qn, tree);
+        value = rust_subst_receiver_args(ctx, value, NULL, NULL, 0, written, 0);
+        if (!value || cbm_type_is_unknown(value) || (result && !cbm_type_equal(result, value))) {
+            return NULL;
+        }
+        result = value;
     }
-    const CBMType *t = rust_parse_def_type_text(ctx->arena, value, module, tree);
-    return t && !cbm_type_is_unknown(t) ? t : NULL;
+    return result;
 }
 
 /* The projection `P::Name` with P one of `params` bound to a known
@@ -7227,7 +7263,8 @@ static const CBMType *rust_subst_projection(RustLSPContext *ctx, const CBMType *
     const char *head = NULL;
     size_t head_len = 0;
     const char *name = rust_projection_name(t, &head, &head_len);
-    if (!name) {
+    /* `P::Name<A>` instantiates a generic associated type: not read here. */
+    if (!name || (t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.arg_count > 0)) {
         return NULL;
     }
     if (self_t && head_len == 4 && strncmp(head, "Self", 4) == 0) {
