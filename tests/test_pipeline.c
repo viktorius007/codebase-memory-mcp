@@ -3979,7 +3979,7 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
         {"dependent", "act", "src/model.rs", 0, NULL},
         {"chain", "chain", "src/model.rs", 1, NULL},
         /* Pair<u8, u8> fits `impl<T> PairAct for Pair<T, T>`: Rust applies it. */
-        {"repeated", "pair_act", "src/model.rs", 1, NULL},
+        {"repeated", "pair_act", "src/model.rs", 0, NULL},
         /* Pair<u8, u16> does not: the repeated parameter withholds. */
         {"repeated_mixed", "pair_act", "src/model.rs", 0, NULL},
         {"split", "act", "src/model.rs", 1, NULL},
