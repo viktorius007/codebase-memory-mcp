@@ -293,6 +293,11 @@ static int parse_string_array(CBMArena *arena, const char *s, int len, int from,
 static int parse_dep_field(CBMArena *a, const char *s, int len, int from, const char *field,
                            CBMCargoDep *dep) {
     if (dep && field && strcmp(field, "path") == 0) return parse_string(a, s, len, from, &dep->path);
+    if (dep && field && strcmp(field, "optional") == 0) {
+        int end = parse_bool(s, len, from, &dep->optional);
+        if (end > from)
+            return end;
+    }
     if (dep && field && strcmp(field, "features") == 0)
         return parse_string_array(a, s, len, from, &dep->features, &dep->feature_count);
     if (dep && field && strcmp(field, "workspace") == 0) {
@@ -520,6 +525,12 @@ static bool cargo_is_dependency_section(const char *section) {
     return strcmp(section, CARGO_WORKSPACE_DEPS) == 0;
 }
 
+/* True for a `[build-dependencies]` section, target-specific ones included. */
+static bool cargo_is_build_dependency_section(const char *section) {
+    const char *tail = strrchr(section, '\x1f');
+    return strcmp(tail ? tail + 1 : section, "build-dependencies") == 0;
+}
+
 /* The last component of a dependency table is the declared crate alias,
  * rather than an entry key. Its parent uses the same section rules as an
  * inline dependency, including target and workspace sections. */
@@ -565,7 +576,7 @@ static int parse_feature_entry(CBMArena *arena, const char *s, int len, int from
     }
     int value_count = 0;
     for (int at = from + 1; at < len && s[at] != ']'; at++)
-        value_count += s[at] == ',' || s[at] == '"' ? 1 : 0;
+        value_count += s[at] == '"' || s[at] == '\'' ? 1 : 0;
     const char **values =
         (const char **)cbm_arena_alloc(arena, (size_t)(value_count + 1) * sizeof(*values));
     if (!values)
@@ -625,6 +636,8 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
                 dependency_table->name = dependency_name;
                 dependency_table->workspace_table =
                     strncmp(section, CARGO_WORKSPACE_DEPS "\x1f", sizeof(CARGO_WORKSPACE_DEPS)) == 0;
+                dependency_table->build = cargo_is_build_dependency_section(
+                    cbm_arena_strndup(arena, section, (size_t)(strrchr(section, '\x1f') - section)));
             }
             static const char *const kinds[] = {"lib", "bin", "test", "example", "bench"};
             for (int t = 0; t < 5; t++)
@@ -649,8 +662,13 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             else from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (dependency_table) {
             from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
-        } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out,
-                                            strcmp(section, CARGO_WORKSPACE_DEPS) == 0);
+        } else if (cargo_is_dependency_section(section)) {
+            int first_new = out->dep_count;
+            from = parse_dep_entry(arena, src, src_len, from, out,
+                                   strcmp(section, CARGO_WORKSPACE_DEPS) == 0);
+            for (int d = first_new; d < out->dep_count; d++)
+                out->deps[d].build = cargo_is_build_dependency_section(section);
+        }
         else if (strcmp(section, "features") == 0) from = parse_feature_entry(arena, src, src_len, from, out);
         else {
             /* Every other table is skipped, `[patch.<source>]` included: a patch

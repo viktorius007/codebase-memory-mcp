@@ -44,6 +44,8 @@ typedef struct {
     bool workspace_table; /* declared in [workspace.dependencies] */
     const char **features; /* `features = [..]`: features it enables in the dependency */
     int feature_count;
+    bool optional; /* `optional = true` */
+    bool build;    /* declared in a `build-dependencies` table */
 } CBMCargoDep;
 
 typedef struct {
