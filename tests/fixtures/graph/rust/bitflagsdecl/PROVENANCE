@@ -1,0 +1,1 @@
+Lane w7-path (2026-10-26): a type declared by another crate's `bitflags!` macro (bevy `RenderAssetUsages`) is a struct of the invoking module, so `Usages::default()` links the module's own `impl Default for Usages`; the macro's generated methods stay unlinked. println! statements print a backtrace (the run is the truth).

@@ -1,0 +1,1 @@
+Lane w7-path (2026-10-26): `Type::from(x)` where the type's only From impl is generic (`impl<T: Into<Color>> From<T> for TextColor`, bevy text/ui) links that impl; `Type::from(Type)` is std's reflexive impl and is not linked to it. println! statements print a backtrace (the run is the truth).

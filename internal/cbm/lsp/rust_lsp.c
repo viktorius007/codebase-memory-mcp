@@ -6732,6 +6732,42 @@ static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const
  * (`E::V`, `Self::V`, or `E::V(..)`) with written type arguments, or its
  * unit struct's type (`Marker`). NULL when the module tree and registry
  * do not prove the item; UNKNOWN when its declaration leaves the type open. */
+/* The declared type of the `const` or `static` item the value path `node`
+ * (text `path`, turbofish stripped) names through the module tree, read in
+ * the module that declares it (`ANTIQUE_WHITE` through a palette glob is a
+ * `Srgba`). NULL when the tree names no such item or the type is unreadable. */
+static const CBMType *rust_const_path_type(RustLSPContext *ctx, TSNode node, const char *path) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        !rust_original_offset(ctx, node, &offset)) {
+        return NULL;
+    }
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve(tree, ctx->arena, ctx->module_qn, offset, path,
+                                 block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                                 block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
+                                 block_uses);
+    const char *dot = r.kind == CBM_RUST_PATH_NOT_FUNCTION && r.value_type && r.qn
+                          ? strrchr(r.qn, '.')
+                          : NULL;
+    if (!dot) {
+        return NULL;
+    }
+    const char *module = cbm_arena_strndup(ctx->arena, r.qn, (size_t)(dot - r.qn));
+    const CBMType *type = rust_parse_def_type_text(ctx->arena, r.value_type, module, tree);
+    /* An applied generic alias (`const C: Alias<u8>`) is withheld: its
+     * arguments are read here without the alias's parameter substitution
+     * proven. A plain alias or type is kept. */
+    const CBMType *base = rust_strip_references(type);
+    if (base && base->kind == CBM_TYPE_TEMPLATE &&
+        rust_lookup_type_alias(ctx, base->data.template_type.template_name)) {
+        return NULL;
+    }
+    return type && !cbm_type_is_unknown(type) ? type : NULL;
+}
+
 static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
     bool bare = strcmp(kind, "identifier") == 0;
@@ -6745,7 +6781,10 @@ static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node
     rust_strip_turbofish(path);
     const char *assoc = NULL;
     const char *owner = rust_value_path_owner(ctx, node, path, &assoc);
-    const CBMRegisteredType *rt = owner ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
+    if (!owner) {
+        return rust_const_path_type(ctx, node, path);
+    }
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, owner);
     if (!rt || rt->alias_of || rt->alias_type) {
         return NULL;
     }
@@ -15938,6 +15977,44 @@ static bool rust_param_type_is(RustLSPContext *ctx, const CBMType *param, const 
  * impl, not the other way round), when no or several impls match, or when an
  * owned and a borrowed impl of the same type both exist and the argument is
  * not a `&expr` (a binding's reference level is not proven). */
+/* True when `arg`, aliases expanded, is proven to be another type than the
+ * receiver `receiver_qn` (its aliases expanded too), so std's reflexive
+ * `impl<T> From<T> for T` cannot be the callee. False when the argument is
+ * unknown or still names an alias the registry cannot expand. */
+static bool rust_from_argument_is_other(RustLSPContext *ctx, const CBMType *arg,
+                                        const char *receiver_qn) {
+    const CBMType *a = rust_expand_type_aliases(ctx, arg, 0);
+    const CBMType *r = rust_expand_type_aliases(ctx, cbm_type_named(ctx->arena, receiver_qn), 0);
+    if (!a || cbm_type_is_unknown(a) || !r)
+        return false;
+    if (a->kind == CBM_TYPE_REFERENCE || a->kind == CBM_TYPE_BUILTIN)
+        return true;
+    const char *ah = a->kind == CBM_TYPE_NAMED      ? a->data.named.qualified_name
+                     : a->kind == CBM_TYPE_TEMPLATE ? a->data.template_type.template_name
+                                                    : NULL;
+    const char *rh = r->kind == CBM_TYPE_NAMED      ? r->data.named.qualified_name
+                     : r->kind == CBM_TYPE_TEMPLATE ? r->data.template_type.template_name
+                                                    : NULL;
+    if (!ah || !rh || rust_lookup_type_alias(ctx, ah))
+        return false;
+    return strcmp(rust_type_name_identity(ctx, ah), rust_type_name_identity(ctx, rh)) != 0;
+}
+
+/* True when `param` (an impl method's parameter type) is one of the impl's
+ * own type parameters (`T` of `impl<T: Into<Color>> From<T> for X`). */
+static bool rust_param_is_impl_type_param(const CBMRegisteredFunc *f, const CBMType *param) {
+    const char *name = !param                               ? NULL
+                       : param->kind == CBM_TYPE_TYPE_PARAM ? param->data.type_param.name
+                       : param->kind == CBM_TYPE_NAMED      ? param->data.named.qualified_name
+                                                            : NULL;
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    const char *leaf = dot ? dot + 1 : name;
+    for (int i = 0; leaf && f->rust_impl_type_params && f->rust_impl_type_params[i]; i++)
+        if (strcmp(f->rust_impl_type_params[i], leaf) == 0)
+            return true;
+    return false;
+}
+
 static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
                                                             const char *receiver_qn,
                                                             const char *method_name,
@@ -15955,6 +16032,8 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     const CBMRegisteredFunc *exact = NULL;
     const char *base_key = NULL;
     int same_base = 0;
+    const CBMRegisteredFunc *generic = NULL; /* the one impl, when its parameter is `T` */
+    int impls = 0;
     CBMMethodIter it;
     cbm_registry_methods_chain(ctx->registry, receiver_qn, method_name, &it);
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
@@ -15969,6 +16048,10 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
         const CBMType *param = sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.param_types
                                    ? sig->data.func.param_types[0]
                                    : NULL;
+        if (!generic || strcmp(generic->impl_key, f->impl_key) != 0) {
+            impls++;
+            generic = rust_param_is_impl_type_param(f, param) ? f : NULL;
+        }
         /* One impl reached through both registries of the chain counts once. */
         if (rust_param_type_is(ctx, rust_strip_references(param), arg_base, 0) &&
             (!base_key || strcmp(base_key, f->impl_key) != 0)) {
@@ -15984,6 +16067,14 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     }
     if (same_base > 1 && strcmp(arg_kind, "reference_expression") != 0) {
         return NULL;
+    }
+    /* `impl<T: Into<Color>> From<T> for TextColor` as the type's only impl
+     * of the trait takes any argument but the type itself, which std's
+     * reflexive `impl<T> From<T> for T` takes instead. */
+    if (!exact && impls == 1 && generic &&
+        rust_trait_qn_same(generic->impl_trait_qn, "core.convert.From") &&
+        rust_from_argument_is_other(ctx, arg, receiver_qn)) {
+        return generic;
     }
     return exact;
 }

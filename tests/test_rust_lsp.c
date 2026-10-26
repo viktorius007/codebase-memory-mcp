@@ -11025,6 +11025,34 @@ TEST(rustlsp_bracketed_generic_param_shadows_module_struct) {
     PASS();
 }
 
+/* `TextColor::from(x)` with `x: Alias`, `type Alias = TextColor`: the
+ * argument is the type itself once the alias is expanded, so std's reflexive
+ * From is the callee, not the corpus `impl<T: Into<Color>> From<T>`. */
+TEST(rustlsp_generic_from_alias_of_self_is_reflexive) {
+    CBMFileResult *r = extract_rust(
+        "struct Color; struct TextColor(Color); "
+        "impl<T: Into<Color>> From<T> for TextColor { fn from(c: T) -> Self { TextColor(c.into()) } } "
+        "type Alias = TextColor; "
+        "fn call(x: Alias) -> TextColor { TextColor::from(x) }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(rust_call_links(r, "TextColor.from"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The generic sole-impl fallback is for core::convert::From only: a corpus
+ * trait whose associated fn is also named `from` is not selected by it. */
+TEST(rustlsp_generic_sole_impl_fallback_requires_from_trait) {
+    CBMFileResult *r = extract_rust(
+        "trait Make<T> { fn from(t: T) -> Self; } struct W; "
+        "impl<T> Make<T> for W { fn from(t: T) -> Self { W } } "
+        "struct Seed; fn call() -> W { W::from(Seed) }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(rust_call_links(r, "W.from"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_written_bounds_select_only_the_trait_declaration) {
     const char *forms[] = {
         "fn call<T: Tr>(t: T) { t.m(); }",
@@ -15331,6 +15359,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_generic_static_two_supertrait_declarations_withhold);
     RUN_TEST(rustlsp_trait_path_reference_arg_with_reference_impl_withholds);
     RUN_TEST(rustlsp_bracketed_generic_param_shadows_module_struct);
+    RUN_TEST(rustlsp_generic_from_alias_of_self_is_reflexive);
+    RUN_TEST(rustlsp_generic_sole_impl_fallback_requires_from_trait);
     RUN_TEST(rustlsp_written_bounds_select_only_the_trait_declaration);
     RUN_TEST(rustlsp_bound_declaration_return_type_preserves_chained_calls);
     RUN_TEST(rustlsp_generic_bound_does_not_replace_a_qualified_concrete_receiver);

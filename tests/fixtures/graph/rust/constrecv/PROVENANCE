@@ -1,0 +1,1 @@
+Lane w7-path (2026-10-26): a `const`/`static` named through the module tree has its declared type: as a method receiver, and as the argument that selects one of several `From` impls (bevy `LinearRgba::from(ANTIQUE_WHITE)` with the css palette consts). println! statements print a backtrace (the run is the truth).
