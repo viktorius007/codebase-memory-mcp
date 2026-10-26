@@ -26,4 +26,5 @@ fn main() {
     qualified();
     nested();
     user::run();
+    user::shadowed();
 }

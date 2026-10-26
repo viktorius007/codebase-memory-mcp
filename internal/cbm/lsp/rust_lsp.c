@@ -11119,8 +11119,8 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
 }
 
 /* The macro_rules! item an invocation of `macro_name` names through path
- * scope: the written path, or every `use` binding its single segment. Two
- * bindings naming different items withhold. */
+ * scope: the written path, or the innermost `use` binding its single
+ * segment. */
 static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name,
                                                const char **crate_path) {
     if (strstr(macro_name, "::")) {
@@ -11131,19 +11131,19 @@ static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *
                                         relative ? rust_resolve_path_expr(ctx, macro_name) : NULL,
                                         strrchr(macro_name, ':') + 1, crate_path);
     }
-    const char *found = NULL;
+    /* Block `use`s follow the file's, so the last source binding is the
+     * innermost; it alone decides, and one the corpus cannot read withholds.
+     * Graph-import entries carry no raw path of their own and are skipped. */
     for (int i = ctx->use_count - 1; i >= 0; i--) {
-        if (strcmp(ctx->use_local_names[i], macro_name) != 0 || !ctx->use_raw_paths[i])
-            continue;
         const char *raw = ctx->use_raw_paths[i];
+        if (strcmp(ctx->use_local_names[i], macro_name) != 0 || !raw ||
+            raw == ctx->use_module_paths[i])
+            continue;
         const char *leaf = strrchr(raw, ':');
-        const char *text = rust_use_path_macro_text(ctx, raw, ctx->use_module_paths[i],
-                                                    leaf ? leaf + 1 : raw, crate_path);
-        if (text && found && strcmp(text, found) != 0)
-            return NULL;
-        found = text ? text : found;
+        return rust_use_path_macro_text(ctx, raw, ctx->use_module_paths[i],
+                                        leaf ? leaf + 1 : raw, crate_path);
     }
-    return found;
+    return NULL;
 }
 
 /* The definition an invocation of `macro_name` expands: the file's own

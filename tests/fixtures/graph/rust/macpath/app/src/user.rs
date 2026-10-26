@@ -10,3 +10,10 @@ pub fn run() {
     emit!(out, [two(), 3]);
     println!("{:?} {:?}", out, items![4]);
 }
+
+/// A block `use` shadows the file's `twice`: the name means std's
+/// stringify! here, so `one()` is never called.
+pub fn shadowed() {
+    use std::stringify as twice;
+    println!("{}", twice!(one()));
+}
