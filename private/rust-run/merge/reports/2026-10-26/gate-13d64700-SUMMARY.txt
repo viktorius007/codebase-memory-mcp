@@ -1,0 +1,18 @@
+gate: base b9a7012c at /home/agent/Developer/cbm-bench/rust-base; 13d64700 (main) in /home/agent/src/codebase-memory-mcp at 2026-10-26 14:35:23; uncommitted files: 0
+build: PASS rc=0 71s log=/scratch/agent/gate5/gate/build.log
+suites: FAIL rc=1 413s log=/scratch/agent/gate5/gate/suites.log
+  ──── edge_imports: every failure site ────
+  ──── pipeline: every failure site ────
+    2225 passed, 0 failed, 0 skipped  (8 selected suites, 16 jobs; selection 1deb4dc0555b2ab69365da308218f1b6dfc68318ce12c62140b75b2bde573f5c)
+  failing-suite logs kept in /scratch/agent/gate5/build-tests/test-logs/failed (3 suite log(s) + results.txt)
+lint: FAIL rc=2 164s log=/scratch/agent/gate5/gate/lint.log
+cpp: PASS rc=0 24s log=/scratch/agent/gate5/gate/cpp.log
+  cpp-react-native-0.88: PASS IDENTICAL edges: before=100835 after=100835 removed=0 added=0 digest before=87cbf4f461a86fe4 after=87cbf4f461a86fe4 semantic: before=22 after=22 removed=0 added=0 diff=/scratch/agent/gate5/gate/cpp-react-native-0.88.cmp
+  cpp-bitcoin-v27: PASS IDENTICAL edges: before=115991 after=115991 removed=0 added=0 digest before=440dd55463e0b2fe after=440dd55463e0b2fe semantic: before=139 after=139 removed=0 added=0 diff=/scratch/agent/gate5/gate/cpp-bitcoin-v27.cmp
+score-codex: calls 226242/229953 flagged 1 (base 226161/229953 flagged 1) 219s; edges base=925193 new=926076 removed=37 added=920; per-type /scratch/agent/gate5/gate/edges-codex.txt lists /scratch/agent/gate5/gate/edges-codex/{removed,added}.tsv
+score-ruff: calls 104504/112300 flagged 1 (base 104067/112300 flagged 1) 122s; edges base=410752 new=411077 removed=110 added=435; per-type /scratch/agent/gate5/gate/edges-ruff.txt lists /scratch/agent/gate5/gate/edges-ruff/{removed,added}.tsv
+score-pm: calls 45167/47116 flagged 87 (base 39983/47116 flagged 73) 88s; edges base=161337 new=171639 removed=95 added=10397; per-type /scratch/agent/gate5/gate/edges-pm.txt lists /scratch/agent/gate5/gate/edges-pm/{removed,added}.tsv
+  WARNING score-pm: credited fell or flagged rose against base
+score-bevy: calls 72341/84295 flagged 36 (base 61368/84295 flagged 35) 113s; edges base=307906 new=319200 removed=2536 added=13830; per-type /scratch/agent/gate5/gate/edges-bevy.txt lists /scratch/agent/gate5/gate/edges-bevy/{removed,added}.tsv
+  WARNING score-bevy: credited fell or flagged rose against base
+GATE: FAIL   disk: 3.8G
