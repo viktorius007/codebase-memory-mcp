@@ -4,6 +4,9 @@ macro_rules! gate {
 gate! {
     mod dep;
 }
+plat::disabled! {
+    mod dep;
+}
 use dep::Thing;
 use plat::collections::{HashMap, HashSet};
 pub fn dropped(x: &Thing) { x.ping(); }

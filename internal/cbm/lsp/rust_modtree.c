@@ -568,6 +568,7 @@ typedef enum {
     RMF_MOD_CLOSE, /* end of the innermost open inline module */
     RMF_IMPORT,    /* `use` / `extern crate` binding `name` (NULL when glob) to `text` */
     RMF_MACRO,     /* an item-position macro call */
+    RMF_MACRO_MOD, /* `mod name;` written in an unexpanded item macro's braces */
     RMF_PRELUDE,   /* item: standard-prelude restriction bits */
 } RmfOp;
 
@@ -754,7 +755,7 @@ static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
  * macro (a path, an alias, another file's definition), an arm that drops or
  * cfg-gates the tokens, or a nested invocation keeps the module's
  * may-declare-unseen-names fact. */
-static void rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
+static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
     TSNode root = invocation;
     for (TSNode parent = ts_node_parent(root); !ts_node_is_null(parent);
          parent = ts_node_parent(root))
@@ -762,10 +763,10 @@ static void rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
     char *expanded = cbm_rust_expand_local_item_macro(&scan->facts->arena, scan->source,
                                                       root, invocation);
     if (!expanded)
-        return;
+        return false;
     TSParser *parser = ts_parser_new();
     if (!parser)
-        return;
+        return true;
     ts_parser_set_language(parser, tree_sitter_rust());
     TSTree *tree = ts_parser_parse_string(parser, NULL, expanded, (uint32_t)strlen(expanded));
     TSNode items = tree ? ts_tree_root_node(tree) : (TSNode){0};
@@ -810,6 +811,48 @@ static void rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
     }
     ts_tree_delete(tree);
     ts_parser_delete(parser);
+    return true;
+}
+
+/* The out-of-line `mod name;` items written in the braces of an item macro
+ * the local expander cannot read (a path, an alias, another file's
+ * definition), as candidates the tree mounts only when nothing else can bind
+ * the name (rmt_mount_macro_mods). */
+static void rmf_scan_macro_mod_candidates(RmfScan *scan, TSNode invocation) {
+    TSNode tokens = cbm_find_child_by_kind(invocation, "token_tree");
+    if (ts_node_is_null(tokens))
+        return;
+    uint32_t start = ts_node_start_byte(tokens);
+    uint32_t end = ts_node_end_byte(tokens);
+    if (end < start + 2 || scan->source[start] != '{' || scan->source[end - 1] != '}')
+        return;
+    CBMArena *arena = &scan->facts->arena;
+    char *body = cbm_arena_strndup(arena, scan->source + start + 1, end - start - 2);
+    if (!body || !strstr(body, "mod "))
+        return;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return;
+    TSTree *tree = NULL;
+    if (ts_parser_set_language(parser, tree_sitter_rust()))
+        tree = ts_parser_parse_string(parser, NULL, body, (uint32_t)strlen(body));
+    ts_parser_delete(parser);
+    if (!tree)
+        return;
+    TSNode items = ts_tree_root_node(tree);
+    for (uint32_t i = 0; !ts_node_has_error(items) && i < ts_node_named_child_count(items); i++) {
+        TSNode item = ts_node_named_child(items, i);
+        TSNode name = ts_node_child_by_field_name(item, "name", 4);
+        if (strcmp(ts_node_type(item), "mod_item") != 0 || ts_node_is_null(name) ||
+            !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4)))
+            continue;
+        rmf_push(scan, (RmfRecord){.op = RMF_MACRO_MOD,
+                                   .item = cbm_rust_prelude_restrictions(arena, body, item),
+                                   .vis = rmf_visibility(body, item),
+                                   .name = cbm_node_text(arena, name, body),
+                                   .text = cbm_rust_path_attribute(arena, body, item)});
+    }
+    ts_tree_delete(tree);
 }
 
 /* Proc macros export a macro name, not the implementation function as a
@@ -862,7 +905,8 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
         rmf_scan_extern_crate(scan, item);
     } else if (strcmp(kind, "macro_invocation") == 0) {
         rmf_push(scan, (RmfRecord){.op = RMF_MACRO});
-        rmf_scan_macro_items(scan, item);
+        if (!rmf_scan_macro_items(scan, item))
+            rmf_scan_macro_mod_candidates(scan, item);
     } else {
         for (size_t i = 0; i < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); i++) {
             if (strcmp(kind, RMT_ITEM_KINDS[i].node_kind) != 0) {
@@ -954,7 +998,27 @@ typedef struct {
     const CBMRustModFacts *const *facts;
     int crate;
     int file;
+    struct RmtMacroMods *pending; /* RMF_MACRO_MOD candidates of the crate */
 } RmtBuild;
+
+typedef struct {
+    RmtBuild build; /* the declaring file's build */
+    const RmfRecord *decl;
+    int module;
+    const char *child_dir;
+    bool inline_scope;
+    int depth;
+} RmtMacroMod;
+
+typedef struct RmtMacroMods {
+    RmtMacroMod *items;
+    int count, cap;
+} RmtMacroMods;
+
+static int rmt_macro_mods_grow(RmtMacroMods *list) {
+    RMT_GROW(list, items, count, cap);
+    return 0;
+}
 
 static void rmt_build_file(const RmtBuild *outer, int module, int file, const char *child_dir,
                            int depth);
@@ -1059,6 +1123,12 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             break;
         case RMF_MACRO:
             tree->modules[module].macro_items = true;
+            break;
+        case RMF_MACRO_MOD:
+            if (build->pending && rmt_macro_mods_grow(build->pending) == 0)
+                build->pending->items[build->pending->count++] = (RmtMacroMod){
+                    .build = *build, .decl = record, .module = module,
+                    .child_dir = child_dir, .inline_scope = inline_scope, .depth = depth};
             break;
         case RMF_ITEM:
             rmt_add_item(tree, module, record->name, RMT_ITEM_KINDS[record->item].kind,
@@ -1698,6 +1768,41 @@ int cbm_rust_modtree_file_count(const CBMRustModTree *tree) {
 
 static void rmt_trait_index_build(CBMRustModTree *tree);
 
+static bool rmt_extern_prelude(CBMRustModTree *tree, int crate, const char *name,
+                               RmtDef *out, bool building);
+
+/* Bounded assumption (macro-declared module): `mod name;` written inside an
+ * item macro the expander cannot read is mounted when its file exists and
+ * nothing else can bind `name` in that module: no dependency, extern crate
+ * or language crate of that name for the crate, no glob import in the
+ * module, no other item, import or module of that name there, and no second
+ * macro-declared candidate for it. A consumer path through `name` compiles
+ * only if the name is bound; with no other candidate, the macro-emitted
+ * declaration is that binding. Otherwise the may-declare fact stays. */
+static void rmt_mount_macro_mods(CBMRustModTree *tree, RmtMacroMods *pending) {
+    for (int i = 0; i < pending->count; i++) {
+        const RmtMacroMod cand = pending->items[i];
+        const char *name = cand.decl->name;
+        int rivals = 0;
+        for (int j = 0; j < pending->count; j++)
+            rivals += pending->items[j].module == cand.module &&
+                      strcmp(pending->items[j].decl->name, name) == 0;
+        char key[RMT_KEY_MAX];
+        int written = snprintf(key, sizeof(key), "%d\x1f%s", cand.module, name);
+        RmtDef external;
+        const char *children_dir = NULL;
+        if (rivals != 1 || written < 0 || written >= (int)sizeof(key) ||
+            tree->modules[cand.module].first_glob >= 0 ||
+            cbm_idxmemo_get(&tree->names, key) >= 0 ||
+            rmt_extern_prelude(tree, tree->modules[cand.module].crate, name, &external, true) ||
+            rmt_out_of_line_file(&cand.build, cand.decl, cand.child_dir, cand.inline_scope,
+                                 &children_dir) < 0)
+            continue;
+        rmt_build_mod_decl(&cand.build, cand.decl, cand.module, cand.child_dir, cand.inline_scope,
+                           cand.depth);
+    }
+}
+
 void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const *facts) {
     /* Preserve restrictions even for files whose containing item macro leaves
      * their module mount unknown. No such file may assume a restricted prelude. */
@@ -1720,8 +1825,12 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
             return;
         }
         tree->crates[c].root_module = root;
-        RmtBuild build = {.tree = tree, .facts = facts, .crate = c, .file = file};
+        RmtMacroMods pending = {0};
+        RmtBuild build = {.tree = tree, .facts = facts, .crate = c, .file = file,
+                          .pending = &pending};
         rmt_build_file(&build, root, file, tree->files[file].dir, 0);
+        rmt_mount_macro_mods(tree, &pending);
+        cbm_free(CBM_MEM_CLASS_OTHER, pending.items);
     }
     int previous_open = tree->import_count + 1;
     for (int pass = 0; pass <= tree->import_count; pass++) {

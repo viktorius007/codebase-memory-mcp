@@ -1,6 +1,4 @@
-macro_rules! enabled {
-    ($($p:tt)*) => { $($p)* };
-}
-enabled! {
+pub mod cfg;
+cfg::alloc! {
     pub mod collections;
 }
