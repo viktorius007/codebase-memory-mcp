@@ -6757,6 +6757,14 @@ static const CBMType *rust_const_path_type(RustLSPContext *ctx, TSNode node, con
     }
     const char *module = cbm_arena_strndup(ctx->arena, r.qn, (size_t)(dot - r.qn));
     const CBMType *type = rust_parse_def_type_text(ctx->arena, r.value_type, module, tree);
+    /* An applied generic alias (`const C: Alias<u8>`) is withheld: its
+     * arguments are read here without the alias's parameter substitution
+     * proven. A plain alias or type is kept. */
+    const CBMType *base = rust_strip_references(type);
+    if (base && base->kind == CBM_TYPE_TEMPLATE &&
+        rust_lookup_type_alias(ctx, base->data.template_type.template_name)) {
+        return NULL;
+    }
     return type && !cbm_type_is_unknown(type) ? type : NULL;
 }
 
@@ -15969,6 +15977,29 @@ static bool rust_param_type_is(RustLSPContext *ctx, const CBMType *param, const 
  * impl, not the other way round), when no or several impls match, or when an
  * owned and a borrowed impl of the same type both exist and the argument is
  * not a `&expr` (a binding's reference level is not proven). */
+/* True when `arg`, aliases expanded, is proven to be another type than the
+ * receiver `receiver_qn` (its aliases expanded too), so std's reflexive
+ * `impl<T> From<T> for T` cannot be the callee. False when the argument is
+ * unknown or still names an alias the registry cannot expand. */
+static bool rust_from_argument_is_other(RustLSPContext *ctx, const CBMType *arg,
+                                        const char *receiver_qn) {
+    const CBMType *a = rust_expand_type_aliases(ctx, arg, 0);
+    const CBMType *r = rust_expand_type_aliases(ctx, cbm_type_named(ctx->arena, receiver_qn), 0);
+    if (!a || cbm_type_is_unknown(a) || !r)
+        return false;
+    if (a->kind == CBM_TYPE_REFERENCE || a->kind == CBM_TYPE_BUILTIN)
+        return true;
+    const char *ah = a->kind == CBM_TYPE_NAMED      ? a->data.named.qualified_name
+                     : a->kind == CBM_TYPE_TEMPLATE ? a->data.template_type.template_name
+                                                    : NULL;
+    const char *rh = r->kind == CBM_TYPE_NAMED      ? r->data.named.qualified_name
+                     : r->kind == CBM_TYPE_TEMPLATE ? r->data.template_type.template_name
+                                                    : NULL;
+    if (!ah || !rh || rust_lookup_type_alias(ctx, ah))
+        return false;
+    return strcmp(rust_type_name_identity(ctx, ah), rust_type_name_identity(ctx, rh)) != 0;
+}
+
 /* True when `param` (an impl method's parameter type) is one of the impl's
  * own type parameters (`T` of `impl<T: Into<Color>> From<T> for X`). */
 static bool rust_param_is_impl_type_param(const CBMRegisteredFunc *f, const CBMType *param) {
@@ -16040,9 +16071,9 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     /* `impl<T: Into<Color>> From<T> for TextColor` as the type's only impl
      * of the trait takes any argument but the type itself, which std's
      * reflexive `impl<T> From<T> for T` takes instead. */
-    if (!exact && impls == 1 && generic && !rust_param_type_is(ctx, arg_base,
-                                                               cbm_type_named(ctx->arena,
-                                                                              receiver_qn), 0)) {
+    if (!exact && impls == 1 && generic &&
+        rust_trait_qn_same(generic->impl_trait_qn, "core.convert.From") &&
+        rust_from_argument_is_other(ctx, arg, receiver_qn)) {
         return generic;
     }
     return exact;

@@ -31,3 +31,16 @@ pub mod palettes {
         pub static ORANGE_RED: Srgba = Srgba(0.5);
     }
 }
+
+pub struct Wrapper<T>(pub T);
+
+impl<T> Wrapper<T> {
+    pub fn get(&self) -> u8 {
+        println!("Wrapper::get\n{}", std::backtrace::Backtrace::force_capture());
+        1
+    }
+}
+
+/* A const typed by an applied generic alias is withheld. */
+pub type Alias<T> = Wrapper<T>;
+pub const WRAPPED: Alias<u8> = Wrapper(3);
