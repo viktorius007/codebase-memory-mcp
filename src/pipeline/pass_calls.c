@@ -1814,10 +1814,36 @@ static char *extract_py_signature(const char *source, int start_line, int end_li
     return sig;
 }
 
+/* Whether the file's final binding of the root name of `ref` (`get_db`, or
+ * `deps` in `deps.get_db`) is the one its Depends(ref) default read when the
+ * definition ran: at most one top-level statement names it, counting a star
+ * import or an any-name binder as one that may. The import map holds the
+ * final binding only; a name bound twice (`from a import x` ... `from b
+ * import x`, or `del x` after the definition) may have held another value
+ * at the definition. */
+static bool pc_depends_binding_unique(const CBMFileResult *result, const char *ref) {
+    const CBMPyNamespaceFacts *facts = &result->py_namespace;
+    if (facts->status != CBM_PY_NS_COMPLETE) {
+        return false;
+    }
+    size_t root_len = strcspn(ref, ".");
+    int binders = 0;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        const char *name = fact->local_name;
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
+            (name && strcmp(name, CBM_PY_NS_ANY_NAME) == 0) ||
+            (name && strlen(name) == root_len && strncmp(name, ref, root_len) == 0)) {
+            binders++;
+        }
+    }
+    return binders <= 1;
+}
+
 /* Scan one function's signature for Depends(func_ref) and create CALLS edges. */
 static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, const char *sig,
-                               const CBMDefinition *def, const char *module_qn, const char **ik,
-                               const char **iv, int ic) {
+                               const CBMFileResult *result, const CBMDefinition *def,
+                               const char *module_qn, const char **ik, const char **iv, int ic) {
     int count = 0;
     cbm_regmatch_t match[PC_REGEX_GRP];
     const char *scan = sig;
@@ -1829,6 +1855,10 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         }
         memcpy(func_ref, scan + match[SKIP_ONE].rm_so, (size_t)ref_len);
         func_ref[ref_len] = '\0';
+        scan += match[0].rm_eo;
+        if (!pc_depends_binding_unique(result, func_ref)) {
+            continue;
+        }
         cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, func_ref, module_qn, ik, iv,
                                                          ic, CBM_LANG_PYTHON);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
@@ -1840,7 +1870,6 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
                 count++;
             }
         }
-        scan += match[0].rm_eo;
     }
     return count;
 }
@@ -1891,11 +1920,13 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
                                                       pc_module_is_dir(files[i].language));
 
-        /* Build import map for alias resolution */
+        /* The names the file's own top-level run binds (the namespace
+         * replay), the map the CALLS passes read for the same file. */
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx, ctx->project_name, files[i].rel_path, files[i].language,
+                                 result, &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -1908,13 +1939,13 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
                 continue;
             }
 
-            edge_count += scan_depends_in_sig(ctx, &depends_re, sig, def, module_qn, imp_keys,
-                                              imp_vals, imp_count);
+            edge_count += scan_depends_in_sig(ctx, &depends_re, sig, result, def, module_qn,
+                                              imp_keys, imp_vals, imp_count);
             free(sig);
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 
