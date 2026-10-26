@@ -7221,9 +7221,14 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                     if (idx >= 0 && idx < base->data.tuple.count) {
                         return base->data.tuple.elems[idx];
                     }
+                    return cbm_type_unknown();
                 }
             }
-            return cbm_type_unknown();
+            /* A tuple struct's position: its declaration registers it as
+             * the field `0`, `1`, ... (pxc_fold_rust_payload_fields). */
+            char *position = rust_node_text(ctx, field);
+            return position ? rust_eval_member_access(ctx, recv, position, false, NULL)
+                            : cbm_type_unknown();
         }
         char *fname = rust_node_text(ctx, field);
         if (!fname) {
