@@ -1323,6 +1323,20 @@ static const char *rust_member_library_root_qn(RustLSPContext *ctx,
     return rust_member_root_prefix(ctx, member);
 }
 
+/* The workspace member a path head names. A head the walked file's crates
+ * take from a registry or git dependency names that crate, never a
+ * same-named member; a file the module tree places in no crate has no
+ * proven extern prelude, so no member is named from it. */
+static const CBMCargoMember *rust_workspace_member(const RustLSPContext *ctx, const char *head) {
+    if (!ctx->cargo_manifest || !head)
+        return NULL;
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    if (tree && (!cbm_rust_modtree_has_file(tree, ctx->module_qn) ||
+                 cbm_rust_modtree_extern_outside(tree, ctx->module_qn, head)))
+        return NULL;
+    return cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head);
+}
+
 /* Rewrite a `crate_name.rest` head onto the member's file-derived prefix. */
 static const char *rust_canonical_workspace_qn(RustLSPContext *ctx, const char *qn) {
     if (!ctx || !qn || !ctx->cargo_manifest || !ctx->module_qn) {
@@ -1339,8 +1353,7 @@ static const char *rust_canonical_workspace_qn(RustLSPContext *ctx, const char *
         return qn;
     }
     char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
-    const CBMCargoMember *member =
-        cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head);
+    const CBMCargoMember *member = rust_workspace_member(ctx, head);
     const char *prefix = NULL;
     if (member) {
         prefix = strchr(dot + 1, '.') ? rust_member_root_prefix(ctx, member)
@@ -1592,8 +1605,7 @@ static const char *rust_resolve_path_in_module(RustLSPContext *ctx, const char *
     const char *sep = strstr(path, "::");
     if (sep && ctx->cargo_manifest) {
         char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(sep - path));
-        const CBMCargoMember *member =
-            cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head);
+        const CBMCargoMember *member = rust_workspace_member(ctx, head);
         const char *member_prefix = NULL;
         if (member) {
             member_prefix = strstr(sep + 2, "::") ? rust_member_root_prefix(ctx, member)
@@ -1979,7 +1991,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
      * the resolver doesn't pollute the module-prefix space. */
     if (ctx->cargo_manifest) {
         const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
-        const CBMCargoMember *mem = cbm_cargo_find_member(m, head);
+        const CBMCargoMember *mem = rust_workspace_member(ctx, head);
         if (mem) {
             /* Workspace member: route to its file-derived `<project>.<path>.src`
              * prefix so the registry's exact QNs can answer. */
@@ -15799,9 +15811,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (head_sep && head_sep > workspace_path) {
                 char *head = cbm_arena_strndup(ctx->arena, workspace_path,
                                                (size_t)(head_sep - workspace_path));
-                const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
-                const CBMCargoMember *workspace_member =
-                    head ? cbm_cargo_find_member(m, head) : NULL;
+                const CBMCargoMember *workspace_member = rust_workspace_member(ctx, head);
                 bool has_library_target = false;
                 for (int target_index = 0;
                      workspace_member && target_index < workspace_member->target_count;

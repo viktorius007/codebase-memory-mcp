@@ -290,8 +290,12 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
     if (field) {
         const char *name = cbm_arena_strndup(a, key, (size_t)(field - key));
         CBMCargoDep *dep = NULL;
+        /* A root's own dependency and its [workspace.dependencies] entry of
+         * the same name are separate records. */
         for (int i = 0; i < out->dep_count; i++)
-            if (strcmp(out->deps[i].name, name) == 0) dep = &out->deps[i];
+            if (strcmp(out->deps[i].name, name) == 0 &&
+                out->deps[i].workspace_table == workspace_table)
+                dep = &out->deps[i];
         if (!dep && out->dep_count < CBM_CARGO_MAX_DEPS) {
             dep = &out->deps[out->dep_count++];
             dep->name = name;

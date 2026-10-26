@@ -4370,6 +4370,33 @@ static const char *pxc_rel_join(CBMArena *arena, const char *dir, const char *re
     return out;
 }
 
+/* Whether `rel`, read from directory `dir` of the repository, leaves the
+ * repository: an absolute path, or more `..` segments than the depth reached. */
+static bool pxc_rel_escapes(const char *dir, const char *rel) {
+    if (rel[0] == '/') {
+        return true;
+    }
+    int depth = 0;
+    for (const char *p = dir; *p; p++) {
+        if ((p == dir || p[-1] == '/') && *p != '/') {
+            depth++;
+        }
+    }
+    for (const char *p = rel; *p;) {
+        const char *end = strchr(p, '/');
+        size_t seg = end ? (size_t)(end - p) : strlen(p);
+        if (seg == 2 && p[0] == '.' && p[1] == '.') {
+            if (--depth < 0) {
+                return true;
+            }
+        } else if (seg > 0 && !(seg == 1 && p[0] == '.')) {
+            depth++;
+        }
+        p = end ? end + 1 : p + seg;
+    }
+    return false;
+}
+
 static int pxc_rust_package_index(const PXCRustCrates *crates, const char *dir) {
     for (int i = 0; i < crates->package_count; i++) {
         if (strcmp(crates->packages[i].dir, dir) == 0) {
@@ -4428,12 +4455,20 @@ static int pxc_rust_add_package(PXCRustCrates *crates, const char *dir) {
 static const char *pxc_rust_dep_dir(const PXCRustCrates *crates, const PXCRustPackage *package,
                                     const CBMCargoDep *dep) {
     if (dep->path) {
-        return pxc_rel_join(crates->arena, package->dir, dep->path);
+        return pxc_rel_escapes(package->dir, dep->path)
+                   ? NULL
+                   : pxc_rel_join(crates->arena, package->dir, dep->path);
+    }
+    /* Without `path`, only `workspace = true` reaches the project, through the
+     * root's [workspace.dependencies] entry; a registry or git dependency
+     * names a crate outside it, whatever its name. */
+    if (!dep->workspace) {
+        return NULL;
     }
     for (int i = 0; crates->root && dep->name && i < crates->root->dep_count; i++) {
         const CBMCargoDep *ws = &crates->root->deps[i];
-        if (ws->path && ws->name && strcmp(ws->name, dep->name) == 0) {
-            return pxc_rel_join(crates->arena, "", ws->path);
+        if (ws->workspace_table && ws->path && ws->name && strcmp(ws->name, dep->name) == 0) {
+            return pxc_rel_escapes("", ws->path) ? NULL : pxc_rel_join(crates->arena, "", ws->path);
         }
     }
     return NULL;
@@ -4539,6 +4574,9 @@ static void pxc_rust_add_package_externs(PXCRustCrates *crates, const PXCRustPac
         }
         for (int d = 0; d < m->dep_count; d++) {
             const CBMCargoDep *dep = &m->deps[d];
+            if (dep->workspace_table) {
+                continue; /* inheritable by members, not a dependency of this package */
+            }
             const char *dir = pxc_rust_dep_dir(crates, package, dep);
             int target = dir ? pxc_rust_package_index(crates, dir) : -1;
             cbm_rust_modtree_add_extern(tree, c, pxc_rust_crate_name(crates->arena, dep->name),

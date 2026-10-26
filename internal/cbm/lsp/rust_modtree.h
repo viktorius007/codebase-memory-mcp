@@ -123,6 +123,13 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
 /* True when the file with this graph module QN belongs to at least one crate. */
 bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn);
 
+/* True when, in every crate that compiles the file with graph module QN
+ * `module_qn`, `name` is an extern-prelude entry naming a crate outside the
+ * project (a registry or git dependency). False when the file belongs to no
+ * crate or any of its crates lacks that entry or maps it into the project. */
+bool cbm_rust_modtree_extern_outside(const CBMRustModTree *tree, const char *module_qn,
+                                     const char *name);
+
 /* Whether every module of the file `caller_qn` lies outside every module of
  * the file `owner_qn`, in every crate that compiles the caller: no module of
  * the owner file is the caller's module or one of its ancestors. That is when
