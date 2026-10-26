@@ -2494,18 +2494,12 @@ static bool pxc_python_binder_fits(const cbm_gbuf_node_t *node, const CBMPyNames
     return node && (!label || (node->label && strcmp(node->label, label) == 0));
 }
 
-/* Whether something other than `owner`'s own binding can answer `member`
- * when its run leaves the name unbound: a module-level `__getattr__` (PEP
- * 562), or, for a package `__init__`, a submodule `member` the import system
- * loads for `from <package> import <member>`. */
-static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
-                                            const cbm_gbuf_node_t *owner,
-                                            const CBMPyNamespaceFacts *facts, const char *member) {
-    for (int i = 0; i < facts->count; i++) {
-        const char *name = facts->items[i].local_name;
-        if (name && (strcmp(name, "__getattr__") == 0 || strcmp(name, CBM_PY_NS_ANY_NAME) == 0))
-            return true;
-    }
+/* Whether `owner` is a package `__init__.py` whose directory provides a
+ * submodule `member` (pxc_python_find_in). Importing that submodule, from
+ * this package or from any other file at any time, sets the package
+ * attribute `member` to it. */
+static bool pxc_python_package_has_submodule(const cbm_pipeline_ctx_t *ctx,
+                                             const cbm_gbuf_node_t *owner, const char *member) {
     const char *path = owner->file_path;
     const char *slash = path ? strrchr(path, '/') : NULL;
     const char *base = slash ? slash + 1 : path;
@@ -2517,6 +2511,83 @@ static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
         return true;
     const cbm_gbuf_node_t *node = NULL;
     return pxc_python_find_in(ctx, dir, member, &node) != PXC_PY_FINDS_NOTHING;
+}
+
+static bool pxc_python_is_submodule(const cbm_gbuf_node_t *node);
+
+/* Whether the dotted `name` starts with the component `first` (`x` or
+ * `x.y` for first `x`). */
+static bool pxc_python_dotted_starts(const char *name, const char *first, size_t len) {
+    return name && strncmp(name, first, len) == 0 && (name[len] == '\0' || name[len] == '.');
+}
+
+/* Whether the import `fact` of the package `__init__` whose directory's last
+ * component is `pkg` loads its submodule `member`: `from . import member`,
+ * `from .member[...] import y`, or the absolute spellings `import
+ * [...].pkg.member[...]` and `from [...].pkg.member[...] import y`. */
+static bool pxc_python_fact_loads_submodule(const CBMPyNamespaceFact *fact, const char *pkg,
+                                            size_t pkg_len, const char *member) {
+    if (fact->kind != CBM_PY_NS_IMPORT_NAME && fact->kind != CBM_PY_NS_IMPORT_MODULE &&
+        fact->kind != CBM_PY_NS_IMPORT_STAR)
+        return false;
+    const char *module = fact->module_name;
+    size_t member_len = strlen(member);
+    if (fact->relative_level == 1)
+        return pxc_python_dotted_starts(module, member, member_len) ||
+               (module && !module[0] && fact->kind == CBM_PY_NS_IMPORT_NAME && fact->member_name &&
+                strcmp(fact->member_name, member) == 0);
+    if (fact->relative_level != 0 || !module)
+        return false;
+    for (const char *at = module; at; at = strchr(at, '.')) {
+        if (*at == '.')
+            at++;
+        if (pxc_python_dotted_starts(at, pkg, pkg_len) && at[pkg_len] == '.' &&
+            pxc_python_dotted_starts(at + pkg_len + 1, member, member_len))
+            return true;
+    }
+    return false;
+}
+
+/* Whether the package `__init__` `owner` imports its submodule `member`
+ * (pxc_python_fact_loads_submodule) no later than the last statement that
+ * binds `member`: the submodule is then loaded before that binding, so no
+ * later import of it resets the package attribute. */
+static bool pxc_python_submodule_loaded_first(const cbm_gbuf_node_t *owner,
+                                              const CBMPyNamespaceFacts *facts,
+                                              const char *member) {
+    const char *path = owner->file_path;
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    if (!slash)
+        return false;
+    const char *pkg = slash;
+    while (pkg > path && pkg[-1] != '/')
+        pkg--;
+    size_t pkg_len = (size_t)(slash - pkg);
+    int last_binder = -1;
+    int loads = -1;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->local_name && strcmp(fact->local_name, member) == 0)
+            last_binder = i;
+        if (loads < 0 && pkg_len && pxc_python_fact_loads_submodule(fact, pkg, pkg_len, member))
+            loads = i;
+    }
+    return loads >= 0 && loads <= last_binder;
+}
+
+/* Whether something other than `owner`'s own binding can answer `member`
+ * when its run leaves the name unbound: a module-level `__getattr__` (PEP
+ * 562), or a submodule `member` the import system loads for `from <package>
+ * import <member>` (pxc_python_package_has_submodule). */
+static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
+                                            const cbm_gbuf_node_t *owner,
+                                            const CBMPyNamespaceFacts *facts, const char *member) {
+    for (int i = 0; i < facts->count; i++) {
+        const char *name = facts->items[i].local_name;
+        if (name && (strcmp(name, "__getattr__") == 0 || strcmp(name, CBM_PY_NS_ANY_NAME) == 0))
+            return true;
+    }
+    return pxc_python_package_has_submodule(ctx, owner, member);
 }
 
 /* The binding `owner`'s top-level run leaves on `member`: the last statement
@@ -2587,6 +2658,15 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
                 : PXC_PY_OPAQUE;
         *out = own;
     }
+    /* A package binding its own name over a submodule of that name holds it
+     * only until the submodule is first imported, which the package's run
+     * does not order unless it imports the submodule itself first
+     * (`from .x import x`); a run importing it after the binding replaces
+     * the binding with the submodule, which the facts do not model. */
+    if (verdict == PXC_PY_BOUND && !pxc_python_is_submodule(*out) &&
+        pxc_python_package_has_submodule(pr->ctx, owner, member) &&
+        !pxc_python_submodule_loaded_first(owner, facts, member))
+        verdict = PXC_PY_OPAQUE;
     if (verdict != PXC_PY_BOUND)
         *out = NULL;
     return verdict;
