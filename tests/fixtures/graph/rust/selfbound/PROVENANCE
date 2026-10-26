@@ -1,0 +1,1 @@
+Lane w5-path (2026-10-26): `Self::f` inside a blanket impl `impl<T: Bound> Trait for T` names the bound's declaration (a where-clause candidate), not the blanket impl's own method (bevy_asset ErasedAssetReader / bevy_gltf ErasedGltfExtensionHandler shape). println! statements print a backtrace (the run is the truth).

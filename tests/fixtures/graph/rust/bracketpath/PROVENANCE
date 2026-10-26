@@ -1,0 +1,1 @@
+Lane w5-path (2026-10-26): `<T>::f` and `<T<_, _>>::f` name what `T::f` names (bevy `<HashMap<_, _>>::default()` shape); a namesake type elsewhere is not linked. println! statements print a backtrace (the run is the truth).
