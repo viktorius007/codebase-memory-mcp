@@ -15969,6 +15969,21 @@ static bool rust_param_type_is(RustLSPContext *ctx, const CBMType *param, const 
  * impl, not the other way round), when no or several impls match, or when an
  * owned and a borrowed impl of the same type both exist and the argument is
  * not a `&expr` (a binding's reference level is not proven). */
+/* True when `param` (an impl method's parameter type) is one of the impl's
+ * own type parameters (`T` of `impl<T: Into<Color>> From<T> for X`). */
+static bool rust_param_is_impl_type_param(const CBMRegisteredFunc *f, const CBMType *param) {
+    const char *name = !param                               ? NULL
+                       : param->kind == CBM_TYPE_TYPE_PARAM ? param->data.type_param.name
+                       : param->kind == CBM_TYPE_NAMED      ? param->data.named.qualified_name
+                                                            : NULL;
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    const char *leaf = dot ? dot + 1 : name;
+    for (int i = 0; leaf && f->rust_impl_type_params && f->rust_impl_type_params[i]; i++)
+        if (strcmp(f->rust_impl_type_params[i], leaf) == 0)
+            return true;
+    return false;
+}
+
 static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
                                                             const char *receiver_qn,
                                                             const char *method_name,
@@ -15986,6 +16001,8 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     const CBMRegisteredFunc *exact = NULL;
     const char *base_key = NULL;
     int same_base = 0;
+    const CBMRegisteredFunc *generic = NULL; /* the one impl, when its parameter is `T` */
+    int impls = 0;
     CBMMethodIter it;
     cbm_registry_methods_chain(ctx->registry, receiver_qn, method_name, &it);
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
@@ -16000,6 +16017,10 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
         const CBMType *param = sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.param_types
                                    ? sig->data.func.param_types[0]
                                    : NULL;
+        if (!generic || strcmp(generic->impl_key, f->impl_key) != 0) {
+            impls++;
+            generic = rust_param_is_impl_type_param(f, param) ? f : NULL;
+        }
         /* One impl reached through both registries of the chain counts once. */
         if (rust_param_type_is(ctx, rust_strip_references(param), arg_base, 0) &&
             (!base_key || strcmp(base_key, f->impl_key) != 0)) {
@@ -16015,6 +16036,14 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     }
     if (same_base > 1 && strcmp(arg_kind, "reference_expression") != 0) {
         return NULL;
+    }
+    /* `impl<T: Into<Color>> From<T> for TextColor` as the type's only impl
+     * of the trait takes any argument but the type itself, which std's
+     * reflexive `impl<T> From<T> for T` takes instead. */
+    if (!exact && impls == 1 && generic && !rust_param_type_is(ctx, arg_base,
+                                                               cbm_type_named(ctx->arena,
+                                                                              receiver_qn), 0)) {
+        return generic;
     }
     return exact;
 }
