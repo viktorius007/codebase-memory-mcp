@@ -7147,6 +7147,31 @@ static bool rust_numeric_primitive(const CBMType *t, bool integer_only) {
 }
 
 /* Unsuffixed integer literals in an index are constrained to usize. */
+/* `Enum::Variant { .. }` is a value of `Enum`: a struct literal whose path
+ * runs through a project type can only name one of its variants. The
+ * owner's QN when the head before the last segment is a registered project
+ * struct or enum (`Self` included), else NULL. */
+static const char *rust_struct_variant_owner(RustLSPContext *ctx, TSNode name_node,
+                                             const char *path) {
+    const char *sep = NULL;
+    for (const char *p = strstr(path, "::"); p; p = strstr(p + 2, "::"))
+        sep = p;
+    if (!sep)
+        return NULL;
+    char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(sep - path));
+    const char *owner = NULL;
+    if (strcmp(head, "Self") == 0) {
+        owner = ctx->self_type_qn;
+    } else {
+        bool ambiguous = false;
+        owner = rust_type_qn_by_module_tree(ctx, name_node, head, &ambiguous);
+        if (ambiguous)
+            return NULL;
+    }
+    const CBMRegisteredType *type = owner ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
+    return type && !type->is_interface && !type->alias_of ? type->qualified_name : NULL;
+}
+
 static const CBMType *rust_index_operand_type(RustLSPContext *ctx, TSNode node) {
     if (strcmp(ts_node_type(node), "integer_literal") == 0) {
         return rust_eval_expr_typed(ctx, node, cbm_type_builtin(ctx->arena, "usize"));
@@ -7592,6 +7617,11 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                 bool ambiguous = false;
                 const char *qn = rust_type_qn_by_module_tree(ctx, name_node, path, &ambiguous);
                 if (ambiguous) return cbm_type_unknown();
+                if (!qn) {
+                    const char *owner = rust_struct_variant_owner(ctx, name_node, path);
+                    if (owner)
+                        return cbm_type_named(ctx->arena, owner);
+                }
                 return cbm_type_named(ctx->arena, qn ? qn : resolve_path_to_type_qn(ctx, path));
             }
         }
