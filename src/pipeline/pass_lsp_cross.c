@@ -2307,6 +2307,10 @@ static bool pxc_python_apply_star(PXCPythonResolver *pr, const char *rel_path, c
                     continue;
                 int found = pxc_python_map_find(&exported, name);
                 const char *value = found >= 0 ? exported.vals[found] : NULL;
+                int held = pxc_python_map_find(map, name);
+                if ((!value || !value[0]) && held >= 0 &&
+                    pxc_python_star_keeps(pr->ctx, owner, &source, name, map->vals[held]))
+                    continue;
                 if (!pxc_python_map_set(map, name, value)) {
                     pxc_python_map_free(&exported);
                     return false;
