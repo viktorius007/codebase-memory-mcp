@@ -11296,10 +11296,106 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
     return exported ? exported : reexported;
 }
 
+static const char *rust_source_path_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               const char **crate_path);
+
+/* `$crate` of a crate the invoking crate has no dependency key for: an
+ * identifier that names the crate root file `root` (hex-encoded QN) and that
+ * only rust_modtree_macro_text reads back. Other paths it heads resolve to
+ * nothing, as an unknown crate head does. */
+static const char RUST_CRATE_MARK[] = "__cbm_crate_";
+
+static const char *rust_crate_mark(RustLSPContext *ctx, const char *root) {
+    size_t len = strlen(root);
+    char *out = (char *)cbm_arena_alloc(ctx->arena, sizeof(RUST_CRATE_MARK) + len * 2);
+    if (!out)
+        return NULL;
+    memcpy(out, RUST_CRATE_MARK, sizeof(RUST_CRATE_MARK) - 1);
+    for (size_t i = 0; i < len; i++)
+        snprintf(out + sizeof(RUST_CRATE_MARK) - 1 + i * 2, 3, "%02x", (unsigned char)root[i]);
+    return out;
+}
+
+/* The crate root file QN a path headed by rust_crate_mark names, with
+ * `*rest` the path after the head; NULL for any other path. */
+static const char *rust_crate_mark_root(RustLSPContext *ctx, const char *path, const char **rest) {
+    size_t mark = sizeof(RUST_CRATE_MARK) - 1;
+    const char *sep = strncmp(path, RUST_CRATE_MARK, mark) == 0 ? strstr(path, "::") : NULL;
+    size_t hex = sep ? (size_t)(sep - path) - mark : 0;
+    char *root = hex > 0 && hex % 2 == 0 ? (char *)cbm_arena_alloc(ctx->arena, hex / 2 + 1) : NULL;
+    for (size_t i = 0; root && i < hex / 2; i++) {
+        unsigned int byte = 0;
+        if (sscanf(path + mark + i * 2, "%2x", &byte) != 1)
+            return NULL;
+        root[i] = (char)byte;
+    }
+    if (!root)
+        return NULL;
+    root[hex / 2] = '\0';
+    *rest = sep + 2;
+    return root;
+}
+
+/* The `#[macro_export]` macro_rules! item the crate module tree resolves
+ * the path `macro_name` to at `invocation`, through `use` items and glob
+ * import chains (a glob the tree cannot read leaves the name open and
+ * withholds). `$crate` then reads as `crate` inside the defining crate, as
+ * the dependency key the invoking crate binds to it, or else as
+ * rust_crate_mark: `$crate` names the defining crate whatever the invoking
+ * crate's dependencies are. */
+static const char *rust_modtree_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                           TSNode invocation, const char **crate_path) {
+    const CBMRustModTree *tree = ctx->imports->modtree;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        ts_node_is_null(invocation) || !rust_original_offset(ctx, invocation, &offset))
+        return NULL;
+    const char *rest = NULL;
+    const char *marked = rust_crate_mark_root(ctx, macro_name, &rest);
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        marked ? cbm_rust_modtree_resolve_macro(tree, ctx->arena, marked, 0,
+                                                cbm_arena_sprintf(ctx->arena, "crate::%s", rest),
+                                                NULL, NULL, 0)
+               : cbm_rust_modtree_resolve_macro(
+                     tree, ctx->arena, ctx->module_qn, offset, macro_name,
+                     block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                     block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL, block_uses);
+    const char *root = r.kind == CBM_RUST_PATH_NOT_FUNCTION && r.qn
+                           ? module_parent_qn(ctx, r.qn)
+                           : NULL;
+    if (!root || !cbm_rust_modtree_has_file(tree, root))
+        return NULL;
+    const char *prefix = module_parent_qn(ctx, root);
+    const char *text =
+        prefix ? rust_exported_macro_text(ctx->imports->macros, prefix, strrchr(r.qn, '.') + 1)
+               : NULL;
+    if (!text)
+        return NULL;
+    const char *own = rust_crate_root_prefix(ctx);
+    const char *dependency = cbm_rust_modtree_crate_name(tree, root);
+    const char *dependency_root =
+        dependency ? cbm_rust_modtree_extern_root(tree, ctx->module_qn, dependency) : NULL;
+    if (own && strcmp(own, prefix) == 0)
+        *crate_path = "crate";
+    else if (dependency_root && strcmp(dependency_root, root) == 0 &&
+             !rust_head_bound_locally(ctx, dependency, true))
+        *crate_path = dependency;
+    else
+        *crate_path = rust_crate_mark(ctx, root);
+    return *crate_path ? text : NULL;
+}
+
 /* The macro_rules! item an invocation of `macro_name` names through path
  * scope: the written path, or the innermost `use` binding its single
- * segment. */
+ * segment, else what the crate module tree resolves the path to. */
 static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               TSNode invocation, const char **crate_path) {
+    const char *text = rust_source_path_macro_text(ctx, macro_name, crate_path);
+    return text ? text : rust_modtree_macro_text(ctx, macro_name, invocation, crate_path);
+}
+
+static const char *rust_source_path_macro_text(RustLSPContext *ctx, const char *macro_name,
                                                const char **crate_path) {
     if (strstr(macro_name, "::")) {
         bool relative = strncmp(macro_name, "crate::", 7) == 0 ||
@@ -11349,7 +11445,7 @@ static RustMacroRule *rust_macro_definition_for(RustLSPContext *ctx, const char 
     /* The `use` bindings in scope differ between invocations, so the path
      * is resolved each time and only the parsed definition is shared. */
     const char *crate_path = NULL;
-    const char *text = rust_path_scoped_macro_text(ctx, macro_name, &crate_path);
+    const char *text = rust_path_scoped_macro_text(ctx, macro_name, invocation, &crate_path);
     if (!text)
         return NULL;
     for (int i = 0; i < ctx->macro_rules_count; i++) {

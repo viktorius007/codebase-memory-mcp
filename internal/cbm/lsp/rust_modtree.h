@@ -143,6 +143,10 @@ bool cbm_rust_modtree_extern_outside(const CBMRustModTree *tree, const char *mod
 const char *cbm_rust_modtree_extern_root(const CBMRustModTree *tree, const char *module_qn,
                                          const char *name);
 
+/* The library name of the crate whose root file has graph module QN
+ * `root_qn`; NULL when no crate or crates of different names root there. */
+const char *cbm_rust_modtree_crate_name(const CBMRustModTree *tree, const char *root_qn);
+
 /* Whether every module of the file `caller_qn` lies outside every module of
  * the file `owner_qn`, in every crate that compiles the caller: no module of
  * the owner file is the caller's module or one of its ancestors. That is when
@@ -182,6 +186,18 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
                                                 const char *module_qn, uint32_t offset,
                                                 const char *path, const char *const *extra_names,
                                                 const char *const *extra_paths, int extra_count);
+
+/* Resolve a macro path (`m`, `a::m`, `crate::m`) written at byte `offset`
+ * in the macro namespace, with the same scoping as cbm_rust_modtree_resolve:
+ * `use` imports and glob chains, and `#[macro_export]` macro_rules! items at
+ * their crate root. NOT_FUNCTION with `qn` `<crate root file QN>.<name>` when
+ * exactly one project macro answers; UNKNOWN or AMBIGUOUS otherwise. A
+ * macro_rules! without `#[macro_export]` is in textual scope only and never
+ * answers here. */
+CBMRustPathResult cbm_rust_modtree_resolve_macro(const CBMRustModTree *tree, CBMArena *arena,
+                                                 const char *module_qn, uint32_t offset,
+                                                 const char *path, const char *const *extra_names,
+                                                 const char *const *extra_paths, int extra_count);
 
 /* Prove a trait binding at this site, including renamed and anonymous
  * imports reached through module globs. Extra globs are raw block-use paths. */

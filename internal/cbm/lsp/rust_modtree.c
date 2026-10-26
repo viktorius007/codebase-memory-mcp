@@ -588,6 +588,7 @@ typedef enum {
     RMF_MACRO,     /* an item-position macro call */
     RMF_MACRO_MOD, /* `mod name;` written in an unexpanded item macro's braces */
     RMF_PRELUDE,   /* item: standard-prelude restriction bits */
+    RMF_MACRO_EXPORT, /* `#[macro_export] macro_rules! name`: an item of the crate root */
 } RmfOp;
 
 typedef struct {
@@ -941,11 +942,42 @@ static bool rmf_scan_proc_macro(RmfScan *scan, TSNode item) {
     return false;
 }
 
+/* Whether an outer attribute of `item` is named `name`. */
+static bool rmf_has_attribute(RmfScan *scan, TSNode item, const char *name) {
+    for (TSNode attr = ts_node_prev_named_sibling(item); !ts_node_is_null(attr);
+         attr = ts_node_prev_named_sibling(attr)) {
+        const char *kind = ts_node_type(attr);
+        if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0)
+            continue;
+        if (strcmp(kind, "attribute_item") != 0)
+            return false;
+        TSNode body = cbm_find_child_by_kind(attr, "attribute");
+        const char *written = ts_node_is_null(body) || ts_node_named_child_count(body) == 0
+                                  ? NULL
+                                  : cbm_node_text(&scan->facts->arena,
+                                                  ts_node_named_child(body, 0), scan->source);
+        if (written && strcmp(written, name) == 0)
+            return true;
+    }
+    return false;
+}
+
 static void rmf_scan_item(RmfScan *scan, TSNode item) {
     const char *kind = ts_node_type(item);
     if (rmf_scan_proc_macro(scan, item))
         return;
-    if (strcmp(kind, "mod_item") == 0) {
+    if (strcmp(kind, "macro_definition") == 0) {
+        /* A `#[macro_export]` macro_rules! is path-addressable at its crate
+         * root (the reference, "Path-based scope"); one without it is not
+         * path-addressable where it stands. */
+        TSNode name = ts_node_child_by_field_name(item, "name", 4);
+        if (!ts_node_is_null(name) && rmf_has_attribute(scan, item, "macro_export"))
+            rmf_push(scan, (RmfRecord){.op = RMF_MACRO_EXPORT,
+                                       .line = ts_node_start_point(item).row + 1,
+                                       .start = ts_node_start_byte(item),
+                                       .name = cbm_node_text(&scan->facts->arena, name,
+                                                             scan->source)});
+    } else if (strcmp(kind, "mod_item") == 0) {
         rmf_scan_mod(scan, item);
     } else if (strcmp(kind, "use_declaration") == 0) {
         rmf_scan_use(scan, item);
@@ -1313,6 +1345,13 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
         case RMF_PRELUDE:
             tree->modules[module].prelude_restrictions |= record->item;
             break;
+        case RMF_MACRO_EXPORT: {
+            int root = tree->crates[build->crate].root_module;
+            rmt_add_item(tree, root, record->name, RMT_MACRO, RMT_NS_MACRO, -1, RMT_VIS_PUB,
+                         record->line, record->start);
+            tree->entries[tree->entry_count - 1].def.conditional = record->conditional;
+            break;
+        }
         case RMF_MACRO:
             tree->modules[module].macro_items = true;
             break;
@@ -1402,7 +1441,8 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
                              strcmp(name, "no_core") == 0 || strcmp(name, "no_std") == 0 ||
                              strcmp(name, "proc_macro") == 0 ||
                              strcmp(name, "proc_macro_attribute") == 0 ||
-                             strcmp(name, "proc_macro_derive") == 0))
+                             strcmp(name, "proc_macro_derive") == 0 ||
+                             strcmp(name, "macro_export") == 0))
                     rmt_digest_node(d, item);
             }
         } else if (strcmp(kind, "mod_item") == 0) {
@@ -1425,6 +1465,9 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
         } else if (strcmp(kind, "extern_crate_declaration") == 0) {
             rmt_digest_str(d, "extern");
             rmt_digest_node(d, item);
+        } else if (strcmp(kind, "macro_definition") == 0) {
+            rmt_digest_str(d, "macro_rules");
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
         } else if (strcmp(kind, "macro_invocation") == 0) {
             /* The expansion read by rmf_scan_macro_items depends on the
              * whole invocation; the definitions enter through the macro
@@ -2113,6 +2156,22 @@ const char *cbm_rust_modtree_extern_root(const CBMRustModTree *tree, const char 
     return root;
 }
 
+const char *cbm_rust_modtree_crate_name(const CBMRustModTree *tree, const char *root_qn) {
+    if (!tree || !root_qn)
+        return NULL;
+    const char *name = NULL;
+    for (int c = 0; c < tree->crate_count; c++) {
+        int root = tree->crates[c].root_module;
+        const char *extern_name = tree->crates[c].extern_name;
+        if (root < 0 || strcmp(tree->files[tree->modules[root].file].qn, root_qn) != 0)
+            continue;
+        if (!extern_name || (name && strcmp(name, extern_name) != 0))
+            return NULL;
+        name = extern_name;
+    }
+    return name;
+}
+
 static bool rmt_is_ancestor(const CBMRustModTree *tree, int ancestor, int module) {
     for (int m = tree->modules[module].parent; m >= 0; m = tree->modules[m].parent) {
         if (m == ancestor) {
@@ -2425,6 +2484,14 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
                                                 const char *path, const char *const *extra_names,
                                                 const char *const *extra_paths, int extra_count) {
     return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_TYPE, extra_names,
+                             extra_paths, extra_count);
+}
+
+CBMRustPathResult cbm_rust_modtree_resolve_macro(const CBMRustModTree *tree, CBMArena *arena,
+                                                 const char *module_qn, uint32_t offset,
+                                                 const char *path, const char *const *extra_names,
+                                                 const char *const *extra_paths, int extra_count) {
+    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_MACRO, extra_names,
                              extra_paths, extra_count);
 }
 
