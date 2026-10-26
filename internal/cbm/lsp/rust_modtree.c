@@ -1730,6 +1730,21 @@ bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn
     return file >= 0 && tree->files[file].first_module >= 0;
 }
 
+bool cbm_rust_modtree_extern_outside(const CBMRustModTree *tree, const char *module_qn,
+                                     const char *name) {
+    int file = tree && module_qn && name ? cbm_idxmemo_get(&tree->file_by_qn, module_qn) : -1;
+    if (file < 0 || tree->files[file].first_module < 0)
+        return false;
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        char key[RMT_KEY_MAX];
+        int written = snprintf(key, sizeof(key), "%d\x1f%s", tree->modules[m].crate, name);
+        if (written <= 0 || written >= (int)sizeof(key) ||
+            cbm_idxmemo_get(&tree->externs, key) != 0)
+            return false;
+    }
+    return true;
+}
+
 static bool rmt_is_ancestor(const CBMRustModTree *tree, int ancestor, int module) {
     for (int m = tree->modules[module].parent; m >= 0; m = tree->modules[m].parent) {
         if (m == ancestor) {

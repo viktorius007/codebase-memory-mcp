@@ -270,6 +270,11 @@ static int parse_dep_field(CBMArena *a, const char *s, int len, int from, const 
     return skip_value(s, len, from);
 }
 
+/* `[patch.<source>]`: one source's replacement table. */
+static bool cargo_is_patch_section(const char *section) {
+    return strncmp(section, "patch\x1f", 6) == 0 && section[6] && !strchr(section + 6, '\x1f');
+}
+
 /* For the `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]`
  * sections, parse `key = value` lines until the next section. The value
  * may be a string (the version) or an inline table. We capture both
@@ -290,8 +295,12 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
     if (field) {
         const char *name = cbm_arena_strndup(a, key, (size_t)(field - key));
         CBMCargoDep *dep = NULL;
+        /* A root's own dependency and its [workspace.dependencies] entry of
+         * the same name are separate records. */
         for (int i = 0; i < out->dep_count; i++)
-            if (strcmp(out->deps[i].name, name) == 0) dep = &out->deps[i];
+            if (strcmp(out->deps[i].name, name) == 0 &&
+                out->deps[i].workspace_table == workspace_table)
+                dep = &out->deps[i];
         if (!dep && out->dep_count < CBM_CARGO_MAX_DEPS) {
             dep = &out->deps[out->dep_count++];
             dep->name = name;
@@ -560,6 +569,14 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
         } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out,
                                             strcmp(section, CARGO_WORKSPACE_DEPS) == 0);
+        else if (cargo_is_patch_section(section)) {
+            /* `[patch.<source>]` entry: recorded as a workspace-table entry that
+             * also carries `workspace`, a pair a real [workspace.dependencies]
+             * entry never has (Cargo rejects `workspace` there). */
+            int first = out->dep_count;
+            from = parse_dep_entry(arena, src, src_len, from, out, true);
+            for (int i = first; i < out->dep_count; i++) out->deps[i].workspace = true;
+        }
         else {
             const char *key = NULL;
             from = cargo_key_path(arena, src, src_len, from, &key);
