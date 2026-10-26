@@ -10974,6 +10974,57 @@ TEST(rustlsp_generic_static_unread_bound_links_declaration) {
     PASS();
 }
 
+/* True when `call` has an admitted (linked) call whose callee contains
+ * `calleeSub`; an unresolved row naming the target does not count. */
+static bool rust_call_links(const CBMFileResult *r, const char *calleeSub) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *c = &r->resolved_calls.items[i];
+        if (c->caller_qn && strstr(c->caller_qn, "call") && c->callee_qn &&
+            strstr(c->callee_qn, calleeSub) && cbm_pipeline_rust_strategy_admitted(c->strategy))
+            return true;
+    }
+    return false;
+}
+
+/* `trait Both: A + B` with A and B both declaring `f`: the read walk finds
+ * two declarations, so `T::f()` withholds even beside an unread bound. */
+TEST(rustlsp_generic_static_two_supertrait_declarations_withhold) {
+    CBMFileResult *r = extract_rust(
+        "trait A { fn f(); } trait B { fn f(); } trait Both: A + B {} "
+        "fn call<T: Both + external::Missing>() { T::f(); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(rust_call_links(r, "A.f"));
+    ASSERT_FALSE(rust_call_links(r, "B.f"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Tr::f(x)` with `x: &T`: a corpus `impl<T: Tr> Tr for &T` may be the
+ * callee, so the referent's bound does not settle the call. */
+TEST(rustlsp_trait_path_reference_arg_with_reference_impl_withholds) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn f(this: Self); } "
+        "impl<T: Tr> Tr for &T { fn f(this: Self) {} } "
+        "fn call<T: Tr>(x: &T) { Tr::f(x); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(rust_call_links(r, "Tr.f"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `<T>::f()` with T a generic parameter: the parameter shadows a module-level
+ * `struct T`, so the struct's inherent `f` is not the callee. */
+TEST(rustlsp_bracketed_generic_param_shadows_module_struct) {
+    CBMFileResult *r = extract_rust(
+        "struct T; impl T { fn f() {} } "
+        "trait Tr { fn f(); } "
+        "fn call<T: Tr>() { <T>::f(); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(rust_call_links(r, ".T.f"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_written_bounds_select_only_the_trait_declaration) {
     const char *forms[] = {
         "fn call<T: Tr>(t: T) { t.m(); }",
@@ -15277,6 +15328,9 @@ void suite_rust_lsp(void) {
 
     /* Cov §U: Trait bounds + multi-impl dispatch */
     RUN_TEST(rustlsp_generic_static_unread_bound_links_declaration);
+    RUN_TEST(rustlsp_generic_static_two_supertrait_declarations_withhold);
+    RUN_TEST(rustlsp_trait_path_reference_arg_with_reference_impl_withholds);
+    RUN_TEST(rustlsp_bracketed_generic_param_shadows_module_struct);
     RUN_TEST(rustlsp_written_bounds_select_only_the_trait_declaration);
     RUN_TEST(rustlsp_bound_declaration_return_type_preserves_chained_calls);
     RUN_TEST(rustlsp_generic_bound_does_not_replace_a_qualified_concrete_receiver);

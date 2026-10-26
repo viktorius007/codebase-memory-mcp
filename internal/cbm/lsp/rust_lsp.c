@@ -151,8 +151,12 @@ static const CBMType *rust_trait_return_type(RustLSPContext *ctx, const CBMType 
                                              const CBMRegisteredType *owner, int depth);
 static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait_qn,
                                           const char *method, bool receiver_method, int depth,
-                                          const char *param, const CBMRegisteredFunc **selected, bool *ambiguous);
+                                          const char *param, const CBMRegisteredFunc **selected, bool *ambiguous,
+                                          bool *unread);
 static void rust_collect_item_bounds(RustLSPContext *ctx, TSNode item);
+static bool rust_name_is_enclosing_type_param(RustLSPContext *ctx, TSNode node,
+                                              const char *name);
+static const char *rust_unbracketed_path(RustLSPContext *ctx, TSNode callee);
 static bool rust_name_in_list(const char **names, const char *name);
 static void rust_collect_trait_bounds(RustLSPContext *ctx, const char *param, TSNode node);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
@@ -8043,7 +8047,8 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
         const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, type_qn);
         if (method_call && !method && trait && trait->is_interface) {
             bool ambiguous = false;
-            rust_bound_trait_declarations(ctx, type_qn, member, true, 0, NULL, &method, &ambiguous);
+            rust_bound_trait_declarations(ctx, type_qn, member, true, 0, NULL, &method, &ambiguous,
+                                          NULL);
             if (ambiguous)
                 return cbm_type_unknown();
         }
@@ -15877,6 +15882,21 @@ static bool rust_first_param_is_self(const CBMRegisteredFunc *f) {
     return leaf && strcmp(leaf, "Self") == 0;
 }
 
+/* True when a corpus impl of `trait_qn` for a reference self type
+ * (`impl<T: Tr> Tr for &T`) defines `method`: a `&x` argument may select it
+ * rather than the referent's bound. */
+static bool rust_reference_impl_defines(RustLSPContext *ctx, const char *trait_qn,
+                                        const char *method) {
+    CBMMethodIter references;
+    cbm_registry_methods_chain(ctx->registry, "core.reference", method, &references);
+    for (int ri; (ri = cbm_method_iter_next(&references)) >= 0;) {
+        const CBMRegisteredFunc *f = &references.reg->funcs[ri];
+        if (f->impl_trait_qn && rust_trait_qn_same(f->impl_trait_qn, trait_qn))
+            return true;
+    }
+    return false;
+}
+
 /* `Trait::m(x, ..)` where `x` is a trait object or a bounded type parameter
  * of the enclosing item (an unregistered name a bound declares): the
  * self type is not a concrete type with an impl, so the call names the
@@ -15896,7 +15916,8 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
     *open_self = false;
     if (ts_node_is_null(first_arg))
         return NULL;
-    const CBMType *self_t = rust_strip_references(rust_eval_expr_type(ctx, first_arg));
+    const CBMType *arg_t = rust_eval_expr_type(ctx, first_arg);
+    const CBMType *self_t = rust_strip_references(arg_t);
     if (!self_t)
         return NULL;
     bool open = self_t->kind == CBM_TYPE_TYPE_PARAM;
@@ -15943,10 +15964,14 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
     bool ambiguous = false;
     /* An unread supertrait (`Sized`) cannot hold a competing `method`: a
      * second declaration would make the path ambiguous (E0034). */
-    rust_bound_trait_declarations(ctx, trait_qn, method, false, 0, NULL, &declaration, &ambiguous);
+    bool unread = false;
+    rust_bound_trait_declarations(ctx, trait_qn, method, false, 0, NULL, &declaration, &ambiguous,
+                                  &unread);
     /* A generic self resolves through its bound, before any blanket impl
      * that may also cover it is selected. */
-    if (!declaration || !rust_first_param_is_self(declaration) ||
+    if (ambiguous || !declaration || !rust_first_param_is_self(declaration) ||
+        (arg_t && arg_t->kind == CBM_TYPE_REFERENCE &&
+         rust_reference_impl_defines(ctx, trait_qn, method)) ||
         (!param_self && rust_trait_method_overridden_open(ctx, declaration->receiver_type, method)))
         return NULL;
     return declaration;
@@ -15965,10 +15990,13 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
     char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
     const char *short_name = dot + 1;
     TSNode first_arg = rust_call_first_argument(callee);
-    char *path = rust_node_text(ctx, callee);
-    if (path) {
-        rust_strip_turbofish(path);
+    char *spelling = rust_node_text(ctx, callee);
+    if (spelling) {
+        rust_strip_turbofish(spelling);
     }
+    /* `<T>::f` is compared as the `T::f` the module tree resolved. */
+    const char *path =
+        spelling && spelling[0] == '<' ? rust_unbracketed_path(ctx, callee) : spelling;
     const char *head_dot = strrchr(head, '.');
     const char *param_name = head_dot ? head_dot + 1 : head;
     if (path &&
@@ -16503,7 +16531,11 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
         return true;
     if (path[0] == '<') {
         path = rust_unbracketed_path(ctx, callee);
-        if (!path)
+        /* A generic parameter in scope shadows a same-named item: `<T>::f`
+         * with `T` a parameter is no path into the module tree. */
+        const char *sep = path ? strstr(path, "::") : NULL;
+        if (!sep || rust_name_is_enclosing_type_param(
+                        ctx, callee, cbm_arena_strndup(ctx->arena, path, (size_t)(sep - path))))
             return false;
     }
     if (strncmp(path, "Self::", 6) == 0) {
@@ -17200,15 +17232,21 @@ static const CBMRegisteredFunc *rust_default_impl_of(RustLSPContext *ctx, const 
 }
 
 /* Every reachable declaration must agree. An unknown trait or truncated
- * supertrait walk cannot prove that another declaration does not compete. */
+ * supertrait walk cannot prove that another declaration does not compete;
+ * with `unread`, a trait the registry cannot read sets it instead, for
+ * callers that may rely on E0034 (a second declaration would not compile). */
 static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait_qn,
                                           const char *method, bool receiver_method, int depth,
-                                          const char *param, const CBMRegisteredFunc **selected, bool *ambiguous) {
+                                          const char *param, const CBMRegisteredFunc **selected, bool *ambiguous,
+                                          bool *unread) {
     if (*ambiguous)
         return;
     const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, trait_qn);
     if (!trait || !trait->is_interface) {
-        *ambiguous = true;
+        if (unread)
+            *unread = true;
+        else
+            *ambiguous = true;
         return;
     }
     if (trait->rust_nominal_identity_ambiguous || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
@@ -17244,7 +17282,8 @@ static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait
         const char *parent = trait->embedded_types[i];
         if (strncmp(parent, RUST_SUPERTRAIT_PREFIX, RUST_SUPERTRAIT_PREFIX_LEN) == 0)
             rust_bound_trait_declarations(ctx, parent + RUST_SUPERTRAIT_PREFIX_LEN, method,
-                                          receiver_method, depth + 1, param, selected, ambiguous);
+                                          receiver_method, depth + 1, param, selected, ambiguous,
+                                          unread);
     }
 }
 
@@ -17262,7 +17301,7 @@ static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const cha
         if (!trait)
             break;
         rust_bound_trait_declarations(ctx, trait, method, receiver_method, 0, param, &declaration,
-                                      &ambiguous);
+                                      &ambiguous, NULL);
     }
     return ambiguous ? NULL : declaration;
 }
@@ -17284,8 +17323,12 @@ static const CBMRegisteredFunc *rust_bound_path_declaration(RustLSPContext *ctx,
         if (!trait)
             break; /* the parameter's scope starts here */
         const CBMRegisteredFunc *declaration = NULL;
+        bool ambiguous = false;
         bool unread = false;
-        rust_bound_trait_declarations(ctx, trait, method, false, 0, param, &declaration, &unread);
+        rust_bound_trait_declarations(ctx, trait, method, false, 0, param, &declaration, &ambiguous,
+                                      &unread);
+        if (ambiguous)
+            return NULL; /* two read declarations, or a trait of unsure identity */
         if (!declaration)
             continue; /* an unread supertrait never removes a declaration found */
         if (found && strcmp(found->qualified_name, declaration->qualified_name) != 0)
