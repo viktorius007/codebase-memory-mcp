@@ -2164,13 +2164,19 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
  * same bytes (pass_calls.c emit_http_async_edge). */
 void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line) {
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
-        size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
+        size_t pos = (size_t)n;
+        /* The line goes BEFORE the args, as in the sequential pass_calls.c
+         * calls_emit_edge. The graph buffer settles two CALLS edges between the same
+         * pair of nodes (equal confidence) by strcmp of the props text; with the
+         * fields in a different order the two drivers compared different fields first
+         * and kept a different call site's line. */
         if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
             int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
             if (ln > 0) {
                 pos += (size_t)ln;
             }
         }
+        pos = append_args_json(props, CBM_SZ_2K, pos, call);
         if (pos < CBM_SZ_2K - SKIP_ONE) {
             props[pos] = '}';
             props[pos + SKIP_ONE] = '\0';
