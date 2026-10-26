@@ -102,6 +102,8 @@ typedef struct {
     const char *extern_name;
     CBMRustEdition edition;
     int root_module;
+    const char **features; /* enabled Cargo features; NULL: not known */
+    int feature_count;
 } RmtCrate;
 
 typedef struct {
@@ -281,6 +283,22 @@ int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
         .root_module = -1,
     };
     return id;
+}
+
+void cbm_rust_modtree_set_crate_features(CBMRustModTree *tree, int crate_id,
+                                         const char *const *features, int count) {
+    if (!tree || crate_id < 0 || crate_id >= tree->crate_count || count < 0) {
+        return;
+    }
+    const char **copy = cbm_arena_alloc(&tree->arena, (size_t)(count + 1) * sizeof(*copy));
+    if (!copy) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        copy[i] = cbm_arena_strdup(&tree->arena, features[i]);
+    }
+    tree->crates[crate_id].features = copy;
+    tree->crates[crate_id].feature_count = count;
 }
 
 void cbm_rust_modtree_add_extern(CBMRustModTree *tree, int crate_id, const char *name,
@@ -583,6 +601,9 @@ typedef struct {
     uint32_t line; /* RMF_ITEM: 1-based line of the item */
     const char *name;
     const char *text;
+    /* conditional records: the item's `#[cfg(..)]` predicates joined as
+     * `all(..)`, NULL when another attribute (cfg_attr) also gates it */
+    const char *cfg;
 } RmfRecord;
 
 struct CBMRustModFacts {
@@ -596,6 +617,7 @@ typedef struct {
     const char *source;
     bool failed;
     bool conditional;
+    const char *cfg; /* predicate of the plain `#[cfg]` attributes when they alone gate */
 } RmfScan;
 
 static int rmf_grow(CBMRustModFacts *facts) {
@@ -609,6 +631,7 @@ static void rmf_push(RmfScan *scan, RmfRecord record) {
         return;
     }
     record.conditional = scan->conditional;
+    record.cfg = scan->conditional ? scan->cfg : NULL;
     scan->facts->records[scan->facts->count++] = record;
 }
 
@@ -788,10 +811,14 @@ static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
     TSNode items = tree ? ts_tree_root_node(tree) : (TSNode){0};
     if (!ts_node_is_null(items) && !ts_node_has_error(items)) {
         bool conditional = scan->conditional;
+        const char *cfg = scan->cfg;
         for (uint32_t i = 0; i < ts_node_named_child_count(items); i++) {
             TSNode item = ts_node_named_child(items, i);
             if (strcmp(ts_node_type(item), "attribute_item") == 0) {
-                scan->conditional |= rmf_attribute_is_cfg(&scan->facts->arena, expanded, item);
+                if (rmf_attribute_is_cfg(&scan->facts->arena, expanded, item)) {
+                    scan->conditional = true;
+                    scan->cfg = NULL;
+                }
             } else if (strcmp(ts_node_type(item), "trait_item") == 0) {
                 TSNode name = ts_node_child_by_field_name(item, "name", 4);
                 for (size_t k = 0; k < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); k++) {
@@ -804,6 +831,7 @@ static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
                         .name = cbm_node_text(&scan->facts->arena, name, expanded)});
                 }
                 scan->conditional = conditional;
+                scan->cfg = cfg;
             } else if (strcmp(ts_node_type(item), "mod_item") == 0) {
                 TSNode name = ts_node_child_by_field_name(item, "name", 4);
                 if (!scan->conditional && !ts_node_is_null(name) &&
@@ -817,12 +845,15 @@ static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
                         .text = cbm_rust_path_attribute(arena, expanded, item)});
                 }
                 scan->conditional = conditional;
+                scan->cfg = cfg;
             } else if (strcmp(ts_node_type(item), "line_comment") != 0 &&
                        strcmp(ts_node_type(item), "block_comment") != 0) {
                 scan->conditional = conditional;
+                scan->cfg = cfg;
             }
         }
         scan->conditional = conditional;
+        scan->cfg = cfg;
     }
     ts_tree_delete(tree);
     ts_parser_delete(parser);
@@ -944,13 +975,27 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
     }
 }
 
+/* The predicate of `#[cfg(PRED)]`: PRED's text, NULL when unreadable. */
+static const char *rmf_cfg_predicate(RmfScan *scan, TSNode attr) {
+    TSNode args = ts_node_child_by_field_name(attr, "arguments", 9);
+    const char *text = ts_node_is_null(args) ? NULL
+                                             : cbm_node_text(&scan->facts->arena, args, scan->source);
+    size_t len = text ? strlen(text) : 0;
+    if (len < 2 || text[0] != '(' || text[len - 1] != ')')
+        return NULL;
+    return cbm_arena_strndup(&scan->facts->arena, text + 1, len - 2);
+}
+
 static void rmf_scan_items(RmfScan *scan, TSNode container) {
     uint8_t restrictions =
         cbm_rust_prelude_restrictions(&scan->facts->arena, scan->source, container);
     if (restrictions)
         rmf_push(scan, (RmfRecord){.op = RMF_PRELUDE, .item = restrictions});
     bool saved = scan->conditional;
+    const char *saved_cfg = scan->cfg;
     scan->conditional = false;
+    scan->cfg = NULL;
+    bool cfg_decidable = true;
     uint32_t count = ts_node_named_child_count(container);
     for (uint32_t i = 0; i < count && !scan->failed; i++) {
         TSNode item = ts_node_named_child(container, i);
@@ -959,15 +1004,26 @@ static void rmf_scan_items(RmfScan *scan, TSNode container) {
             if (!ts_node_is_null(attr) && ts_node_named_child_count(attr) > 0) {
                 const char *name =
                     cbm_node_text(&scan->facts->arena, ts_node_named_child(attr, 0), scan->source);
-                scan->conditional |=
-                    name && (strcmp(name, "cfg") == 0 || strcmp(name, "cfg_attr") == 0);
+                bool cfg = name && strcmp(name, "cfg") == 0;
+                if (cfg || (name && strcmp(name, "cfg_attr") == 0)) {
+                    scan->conditional = true;
+                    const char *predicate = cfg ? rmf_cfg_predicate(scan, attr) : NULL;
+                    cfg_decidable &= predicate != NULL;
+                    scan->cfg = !cfg_decidable ? NULL
+                                : scan->cfg ? cbm_arena_sprintf(&scan->facts->arena, "all(%s, %s)",
+                                                                scan->cfg, predicate)
+                                            : predicate;
+                }
             }
             continue;
         }
         rmf_scan_item(scan, item);
         scan->conditional = false;
+        scan->cfg = NULL;
+        cfg_decidable = true;
     }
     scan->conditional = saved;
+    scan->cfg = saved_cfg;
 }
 
 void cbm_rust_modfacts_free(CBMRustModFacts *facts) {
@@ -1097,6 +1153,117 @@ static int rmf_skip_body(const CBMRustModFacts *facts, int at) {
 
 /* Apply the facts from `at` to `module` up to the close of its body (or the
  * end of the file); returns the index after the last fact applied. */
+typedef enum { RMT_CFG_FALSE, RMT_CFG_TRUE, RMT_CFG_UNKNOWN } RmtCfg;
+
+enum { RMT_CFG_MAX_DEPTH = 16, RMT_CFG_MAX_WORD = 64 };
+
+typedef struct {
+    const char *at;
+    const RmtCrate *crate;
+    bool failed;
+} RmtCfgParse;
+
+static void rmt_cfg_space(RmtCfgParse *p) {
+    while (*p->at == ' ' || *p->at == '\t' || *p->at == '\n' || *p->at == '\r')
+        p->at++;
+}
+
+static bool rmt_cfg_feature_enabled(const RmtCrate *crate, const char *name, size_t len) {
+    for (int i = 0; i < crate->feature_count; i++)
+        if (strlen(crate->features[i]) == len && strncmp(crate->features[i], name, len) == 0)
+            return true;
+    return false;
+}
+
+/* One cfg predicate under the crate's enabled features. `feature = ".."`
+ * is decided, `all`, `any` and `not` combine three-valued; every other
+ * option (`test`, `unix`, `target_os = ..`) is unknown. */
+static RmtCfg rmt_cfg_eval(RmtCfgParse *p, int depth) {
+    rmt_cfg_space(p);
+    const char *word = p->at;
+    while ((*p->at >= 'a' && *p->at <= 'z') || (*p->at >= 'A' && *p->at <= 'Z') ||
+           (*p->at >= '0' && *p->at <= '9') || *p->at == '_')
+        p->at++;
+    size_t word_len = (size_t)(p->at - word);
+    rmt_cfg_space(p);
+    if (word_len == 0 || word_len > RMT_CFG_MAX_WORD || depth > RMT_CFG_MAX_DEPTH) {
+        p->failed = true;
+        return RMT_CFG_UNKNOWN;
+    }
+    if (*p->at == '=') {
+        p->at++;
+        rmt_cfg_space(p);
+        if (*p->at != '"') {
+            p->failed = true;
+            return RMT_CFG_UNKNOWN;
+        }
+        const char *value = ++p->at;
+        while (*p->at && *p->at != '"' && *p->at != '\\')
+            p->at++;
+        if (*p->at != '"') {
+            p->failed = true;
+            return RMT_CFG_UNKNOWN;
+        }
+        size_t value_len = (size_t)(p->at - value);
+        p->at++;
+        if (word_len == 7 && strncmp(word, "feature", 7) == 0)
+            return rmt_cfg_feature_enabled(p->crate, value, value_len) ? RMT_CFG_TRUE
+                                                                      : RMT_CFG_FALSE;
+        return RMT_CFG_UNKNOWN;
+    }
+    if (*p->at != '(')
+        return RMT_CFG_UNKNOWN;
+    bool all = word_len == 3 && strncmp(word, "all", 3) == 0;
+    bool any = word_len == 3 && strncmp(word, "any", 3) == 0;
+    bool not = word_len == 3 && strncmp(word, "not", 3) == 0;
+    p->at++;
+    int count = 0;
+    bool saw_false = false, saw_true = false, saw_unknown = false;
+    RmtCfg last = RMT_CFG_UNKNOWN;
+    for (;;) {
+        rmt_cfg_space(p);
+        if (*p->at == ')')
+            break;
+        last = rmt_cfg_eval(p, depth + 1);
+        if (p->failed)
+            return RMT_CFG_UNKNOWN;
+        count++;
+        saw_false |= last == RMT_CFG_FALSE;
+        saw_true |= last == RMT_CFG_TRUE;
+        saw_unknown |= last == RMT_CFG_UNKNOWN;
+        rmt_cfg_space(p);
+        if (*p->at == ',')
+            p->at++;
+        else if (*p->at != ')') {
+            p->failed = true;
+            return RMT_CFG_UNKNOWN;
+        }
+    }
+    p->at++;
+    if (all)
+        return saw_false ? RMT_CFG_FALSE : saw_unknown ? RMT_CFG_UNKNOWN : RMT_CFG_TRUE;
+    if (any)
+        return saw_true ? RMT_CFG_TRUE : saw_unknown ? RMT_CFG_UNKNOWN : RMT_CFG_FALSE;
+    if (not && count == 1)
+        return last == RMT_CFG_TRUE ? RMT_CFG_FALSE
+               : last == RMT_CFG_FALSE ? RMT_CFG_TRUE
+                                       : RMT_CFG_UNKNOWN;
+    return RMT_CFG_UNKNOWN;
+}
+
+/* What a conditional record's `#[cfg]` predicate says in the crate being
+ * built: UNKNOWN unless the crate's features are known and the predicate
+ * reads completely. */
+static RmtCfg rmt_record_cfg(const CBMRustModTree *tree, int crate, const RmfRecord *record) {
+    if (!record->conditional || !record->cfg || crate < 0 || crate >= tree->crate_count ||
+        !tree->crates[crate].features)
+        return RMT_CFG_UNKNOWN;
+    RmtCfgParse parse = {.at = record->cfg, .crate = &tree->crates[crate]};
+    RmtCfg value = rmt_cfg_eval(&parse, 0);
+    rmt_cfg_space(&parse);
+    return parse.failed || *parse.at ? RMT_CFG_UNKNOWN : value;
+}
+
 static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, int at, int module,
                            const char *child_dir, bool inline_scope, int depth) {
     CBMRustModTree *tree = build->tree;
@@ -1106,6 +1273,10 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
         case RMF_MOD_CLOSE:
             return at;
         case RMF_MOD_OPEN: {
+            if (rmt_record_cfg(tree, build->crate, record) == RMT_CFG_FALSE) {
+                at = rmf_skip_body(facts, at);
+                break;
+            }
             const char *dir =
                 child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/%s", child_dir, record->name)
                              : cbm_arena_strdup(&tree->arena, record->name);
@@ -1126,11 +1297,15 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             break;
         }
         case RMF_MOD_DECL:
-            rmt_build_mod_decl(build, record, module, child_dir, inline_scope, depth);
+            if (rmt_record_cfg(tree, build->crate, record) != RMT_CFG_FALSE)
+                rmt_build_mod_decl(build, record, module, child_dir, inline_scope, depth);
             break;
         case RMF_IMPORT: {
+            RmtCfg cfg = rmt_record_cfg(tree, build->crate, record);
+            if (cfg == RMT_CFG_FALSE)
+                break;
             int id = rmt_add_import(tree, module, record->name, record->text, record->glob,
-                                    record->vis, record->conditional);
+                                    record->vis, record->conditional && cfg != RMT_CFG_TRUE);
             if (id >= 0)
                 tree->imports[id].extern_crate = record->item != 0;
             break;
@@ -1147,12 +1322,17 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
                     .build = *build, .decl = record, .module = module,
                     .child_dir = child_dir, .inline_scope = inline_scope, .depth = depth};
             break;
-        case RMF_ITEM:
+        case RMF_ITEM: {
+            RmtCfg cfg = rmt_record_cfg(tree, build->crate, record);
+            if (cfg == RMT_CFG_FALSE)
+                break;
             rmt_add_item(tree, module, record->name, RMT_ITEM_KINDS[record->item].kind,
                          RMT_ITEM_KINDS[record->item].ns, -1, record->vis, record->line,
                          record->start);
-            tree->entries[tree->entry_count - 1].def.conditional = record->conditional;
+            tree->entries[tree->entry_count - 1].def.conditional =
+                record->conditional && cfg != RMT_CFG_TRUE;
             break;
+        }
         default:
             break;
         }

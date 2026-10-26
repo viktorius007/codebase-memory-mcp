@@ -42,6 +42,10 @@ typedef struct {
     const char *path;     /* path = "../foo" if local, else NULL */
     bool workspace;       /* workspace = true: the root's [workspace.dependencies] entry */
     bool workspace_table; /* declared in [workspace.dependencies] */
+    const char **features; /* `features = [..]`: features it enables in the dependency */
+    int feature_count;
+    bool optional; /* `optional = true` */
+    bool build;    /* declared in a `build-dependencies` table */
 } CBMCargoDep;
 
 typedef struct {
@@ -52,6 +56,13 @@ typedef struct {
     const CBMCargoTarget *targets;
     int target_count;
 } CBMCargoMember;
+
+/* One `[features]` entry: `name = ["value", ..]`. */
+typedef struct {
+    const char *name;
+    const char **values;
+    int value_count;
+} CBMCargoFeature;
 
 typedef struct CBMCargoManifest {
     const char *package_name;      /* [package].name, NULL if missing */
@@ -76,6 +87,10 @@ typedef struct CBMCargoManifest {
 
     CBMCargoMember members[CBM_CARGO_MAX_MEMBERS];
     int member_count;
+
+    CBMCargoFeature *features; /* the `[features]` table, in manifest order */
+    int feature_count;
+    int feature_capacity;
 } CBMCargoManifest;
 
 /* Parse a Cargo.toml-formatted string. The output strings are
