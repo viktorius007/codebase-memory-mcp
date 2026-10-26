@@ -746,6 +746,17 @@ static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
                                .item = 1});
 }
 
+/* True when `attribute_item` is `#[cfg ..]` or `#[cfg_attr ..]`, read by
+ * its name token so spacing and comments before the arguments do not hide
+ * it. */
+static bool rmf_attribute_is_cfg(CBMArena *arena, const char *source, TSNode attribute_item) {
+    TSNode attr = cbm_find_child_by_kind(attribute_item, "attribute");
+    if (ts_node_is_null(attr) || ts_node_named_child_count(attr) == 0)
+        return false;
+    const char *name = cbm_node_text(arena, ts_node_named_child(attr, 0), source);
+    return name && (strcmp(name, "cfg") == 0 || strcmp(name, "cfg_attr") == 0);
+}
+
 /* The resolver already expands local macro_rules!. Reuse that matcher so
  * a trait re-export can reach an actual generated declaration, rather than
  * trusting an item-shaped argument which the macro might discard.
@@ -775,8 +786,7 @@ static bool rmf_scan_macro_items(RmfScan *scan, TSNode invocation) {
         for (uint32_t i = 0; i < ts_node_named_child_count(items); i++) {
             TSNode item = ts_node_named_child(items, i);
             if (strcmp(ts_node_type(item), "attribute_item") == 0) {
-                const char *text = cbm_node_text(&scan->facts->arena, item, expanded);
-                scan->conditional |= text && (strstr(text, "cfg(") || strstr(text, "cfg_attr("));
+                scan->conditional |= rmf_attribute_is_cfg(&scan->facts->arena, expanded, item);
             } else if (strcmp(ts_node_type(item), "trait_item") == 0) {
                 TSNode name = ts_node_child_by_field_name(item, "name", 4);
                 for (size_t k = 0; k < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); k++) {
@@ -828,7 +838,9 @@ static void rmf_scan_macro_mod_candidates(RmfScan *scan, TSNode invocation) {
         return;
     CBMArena *arena = &scan->facts->arena;
     char *body = cbm_arena_strndup(arena, scan->source + start + 1, end - start - 2);
-    if (!body || !strstr(body, "mod "))
+    /* A cheap byte filter only; the parse below finds `mod` as a token,
+     * whatever spacing or comments follow it. */
+    if (!body || !strstr(body, "mod"))
         return;
     TSParser *parser = ts_parser_new();
     if (!parser)
@@ -1779,6 +1791,15 @@ static bool rmt_extern_prelude(CBMRustModTree *tree, int crate, const char *name
  * macro-declared candidate for it. A consumer path through `name` compiles
  * only if the name is bound; with no other candidate, the macro-emitted
  * declaration is that binding. Otherwise the may-declare fact stays. */
+/* A dependency key of the crate's package binds `name` whether or not the
+ * dependency's crate root is registered. */
+static bool rmt_package_binds(const CBMRustModTree *tree, int crate, const char *name) {
+    char key[RMT_KEY_MAX];
+    int written = snprintf(key, sizeof(key), "%d\x1f%s", crate, name);
+    return written < 0 || written >= (int)sizeof(key) ||
+           cbm_idxmemo_get(&tree->externs, key) >= 0;
+}
+
 static void rmt_mount_macro_mods(CBMRustModTree *tree, RmtMacroMods *pending) {
     for (int i = 0; i < pending->count; i++) {
         const RmtMacroMod cand = pending->items[i];
@@ -1793,7 +1814,8 @@ static void rmt_mount_macro_mods(CBMRustModTree *tree, RmtMacroMods *pending) {
         const char *children_dir = NULL;
         if (rivals != 1 || written < 0 || written >= (int)sizeof(key) ||
             tree->modules[cand.module].first_glob >= 0 ||
-            cbm_idxmemo_get(&tree->names, key) >= 0 ||
+            cbm_idxmemo_get(&tree->names, key) >= 0 || rmt_in_list(RMT_PRELUDE, name) ||
+            rmt_package_binds(tree, tree->modules[cand.module].crate, name) ||
             rmt_extern_prelude(tree, tree->modules[cand.module].crate, name, &external, true) ||
             rmt_out_of_line_file(&cand.build, cand.decl, cand.child_dir, cand.inline_scope,
                                  &children_dir) < 0)
@@ -1815,6 +1837,7 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
     if (!tree || !facts) {
         return;
     }
+    RmtMacroMods pending = {0};
     for (int c = 0; c < tree->crate_count; c++) {
         int file = rmt_file_id(tree, tree->crates[c].root_rel);
         if (file < 0) {
@@ -1822,16 +1845,18 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
         }
         int root = rmt_new_module(tree, c, -1, file, 0, UINT32_MAX);
         if (root < 0) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pending.items);
             return;
         }
         tree->crates[c].root_module = root;
-        RmtMacroMods pending = {0};
         RmtBuild build = {.tree = tree, .facts = facts, .crate = c, .file = file,
                           .pending = &pending};
         rmt_build_file(&build, root, file, tree->files[file].dir, 0);
-        rmt_mount_macro_mods(tree, &pending);
-        cbm_free(CBM_MEM_CLASS_OTHER, pending.items);
     }
+    /* After every crate root exists, so a dependency registered after its
+     * dependent still reads as a binding. */
+    rmt_mount_macro_mods(tree, &pending);
+    cbm_free(CBM_MEM_CLASS_OTHER, pending.items);
     int previous_open = tree->import_count + 1;
     for (int pass = 0; pass <= tree->import_count; pass++) {
         for (int i = 0; i < tree->import_count; i++)
