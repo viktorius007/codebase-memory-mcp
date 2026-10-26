@@ -1,6 +1,6 @@
 //! Imports the re-exported macro by path.
 use crate::emit::two;
-use crate::helpers::{one, twice};
+use crate::helpers::{once, one, twice};
 use crate::{emit, items};
 
 pub fn run() {
@@ -16,4 +16,9 @@ pub fn run() {
 pub fn shadowed() {
     use std::stringify as twice;
     println!("{}", twice!(one()));
+}
+
+/// The importer gets the first `once!`, which only stringifies.
+pub fn reexported_first() {
+    println!("{}", once!(one()));
 }

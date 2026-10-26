@@ -10592,12 +10592,21 @@ typedef struct {
     bool macro_use; /* `#[macro_use]` lifts the child's macros into this module */
 } RustMacroFactMod;
 
+/* A file-level `use name;` naming a single identifier: it re-exports the
+ * macro_rules! definition of `name` textually visible at `start_byte`. */
+typedef struct {
+    const char *name;
+    uint32_t start_byte;
+} RustMacroFactUse;
+
 struct CBMRustMacroFacts {
     CBMArena arena;
     RustMacroFactDef *defs;
     int def_count;
     RustMacroFactMod *mods;
     int mod_count;
+    RustMacroFactUse *uses;
+    int use_count;
 };
 
 typedef struct {
@@ -10665,9 +10674,23 @@ static bool rust_macro_facts_collect(CBMRustMacroFacts *facts, const char *sourc
     uint32_t count = ts_node_named_child_count(root);
     int def_cap = 0;
     int mod_cap = 0;
+    int use_cap = 0;
     for (uint32_t i = 0; i < count; i++) {
         TSNode item = ts_node_named_child(root, i);
         const char *kind = ts_node_type(item);
+        TSNode use_arg = strcmp(kind, "use_declaration") == 0
+                             ? ts_node_child_by_field_name(item, "argument", 8)
+                             : (TSNode){0};
+        if (!ts_node_is_null(use_arg) && strcmp(ts_node_type(use_arg), "identifier") == 0) {
+            char *use_name = cbm_node_text(&facts->arena, use_arg, source);
+            if (!use_name || !rust_macro_facts_reserve(&facts->arena, (void **)&facts->uses,
+                                                       facts->use_count, &use_cap,
+                                                       sizeof(RustMacroFactUse)))
+                return false;
+            facts->uses[facts->use_count++] =
+                (RustMacroFactUse){.name = use_name, .start_byte = ts_node_start_byte(item)};
+            continue;
+        }
         bool is_def = strcmp(kind, "macro_definition") == 0;
         bool is_mod = strcmp(kind, "mod_item") == 0 &&
                       ts_node_is_null(ts_node_child_by_field_name(item, "body", 4));
@@ -10770,6 +10793,18 @@ uint64_t cbm_rust_macro_facts_digest(const char *source, int len, TSNode root) {
             hash = rust_macro_digest_mix(hash, mod->macro_use ? "U" : mod->has_path ? "P" : "M");
             hash = rust_macro_digest_mix(hash, mod->name);
         }
+    }
+    /* Each re-export with the number of definitions before it. */
+    for (int u = 0; u < facts->use_count; u++) {
+        int before = 0;
+        while (before < facts->def_count &&
+               facts->defs[before].end_byte <= facts->uses[u].start_byte)
+            before++;
+        char count_text[16];
+        snprintf(count_text, sizeof(count_text), "%d", before);
+        hash = rust_macro_digest_mix(hash, "R");
+        hash = rust_macro_digest_mix(hash, facts->uses[u].name);
+        hash = rust_macro_digest_mix(hash, count_text);
     }
     cbm_rust_macro_facts_free(facts);
     return hash ? hash : 1;
@@ -11045,8 +11080,8 @@ static const char *rust_exported_macro_text(const CBMRustMacroTable *table, cons
     return found;
 }
 
-/* The definition of `name` that the module file `file` defines and
- * re-exports with `use name;`, or NULL. */
+/* The definition of `name` that the module file `file` re-exports with a
+ * file-level `use name;`, or NULL. */
 static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const char *file,
                                                    const char *name) {
     const CBMRustMacroFacts *facts = rust_macro_table_file(ctx->imports->macros, file);
@@ -11054,9 +11089,20 @@ static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const ch
         facts && ctx->imports->lookup ? ctx->imports->lookup(ctx->imports->ctx, file, name) : NULL;
     if (!bound || strcmp(bound, name) != 0)
         return NULL;
+    /* The definition textually visible at the `use`: the last one before it.
+     * Two file-level `use name;` items would conflict (E0252). */
+    const RustMacroFactUse *reexport = NULL;
+    for (int u = 0; u < facts->use_count; u++) {
+        if (strcmp(facts->uses[u].name, name) == 0) {
+            if (reexport)
+                return NULL;
+            reexport = &facts->uses[u];
+        }
+    }
     const RustMacroFactDef *best = NULL;
-    for (int d = 0; d < facts->def_count; d++) {
-        if (strcmp(facts->defs[d].name, name) == 0)
+    for (int d = 0; reexport && d < facts->def_count; d++) {
+        if (strcmp(facts->defs[d].name, name) == 0 &&
+            facts->defs[d].end_byte <= reexport->start_byte)
             best = &facts->defs[d];
     }
     return best ? best->text : NULL;

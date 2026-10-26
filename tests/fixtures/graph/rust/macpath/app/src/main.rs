@@ -27,4 +27,5 @@ fn main() {
     nested();
     user::run();
     user::shadowed();
+    user::reexported_first();
 }
