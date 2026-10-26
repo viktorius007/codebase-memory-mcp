@@ -822,10 +822,11 @@ static bool py_ns_import_rebinds(PyNamespaceBuilder *b, TSNode node, int start) 
 
 static bool py_ns_scan_rebinds_from(PyNamespaceBuilder *b, TSNode root, int start);
 
-/* The parts of a definition or class header that run in the enclosing scope
- * when the statement runs: parameter defaults and annotations, the return
- * annotation, and the bases and keywords of a class. A walrus there binds a
- * module name (`class C(B := base()):`, `def f(a=(d := 1)):`). */
+/* The parts of a definition, class or lambda header that run in the
+ * enclosing scope when the statement runs: parameter defaults and
+ * annotations, the return annotation, and the bases and keywords of a class.
+ * A walrus there binds a module name (`class C(B := base()):`,
+ * `def f(a=(d := 1)):`, `lambda y=(t := 1): y`). */
 static bool py_ns_header_rebinds(PyNamespaceBuilder *b, TSNode def, int start) {
     static const char *const fields[] = {"parameters", "return_type", "superclasses"};
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
@@ -864,6 +865,7 @@ static bool py_ns_scan_rebinds_from(PyNamespaceBuilder *b, TSNode root, int star
                  py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME, binder);
             descend = false;
         } else if (strcmp(kind, "lambda") == 0) {
+            ok = py_ns_header_rebinds(b, node, start);
             descend = false;
         } else if (strcmp(kind, "import_statement") == 0 ||
                    strcmp(kind, "import_from_statement") == 0) {
