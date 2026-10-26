@@ -5349,8 +5349,10 @@ static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
 
 /* bevy_render's `impl IntoIterator for &'a Extract<'w, 's, P>` yields
  * `<&'a SystemParamItem<'w, 's, P> as IntoIterator>::Item`: a borrowed
- * Extract iterates as a borrow of the parameter it derefs to. That borrow,
- * when `t` is `&Extract<P>` or `&mut Extract<P>` and the Deref target is read
+ * Extract iterates as a shared borrow of the parameter it derefs to. P is
+ * bounded by ReadOnlySystemParam, so the item is always the read-only one,
+ * whatever borrow of the Extract is written. That shared borrow, when `t` is
+ * a borrowed `Extract<P>` and the Deref target is read
  * (rust_bevy_system_param_item); else NULL. */
 static const CBMType *rust_bevy_extract_iterated(RustLSPContext *ctx, const CBMType *t) {
     static const char suffix[] = ".crates.bevy_render.src.extract_param.Extract";
@@ -5365,7 +5367,7 @@ static const CBMType *rust_bevy_extract_iterated(RustLSPContext *ctx, const CBMT
         return NULL;
     }
     const CBMType *target = rust_deref_step(ctx, base);
-    return target && !cbm_type_is_unknown(target) ? rust_reference_like(ctx->arena, target, t)
+    return target && !cbm_type_is_unknown(target) ? rust_reference_type(ctx->arena, target, true)
                                                    : NULL;
 }
 

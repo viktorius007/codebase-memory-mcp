@@ -5492,27 +5492,85 @@ static bool rust_subtree_has_kind(TSNode node, const char *kind, int depth) {
     return false;
 }
 
+/* True when `text` holds `name` as a whole identifier. */
+static bool rust_text_has_ident(const char *text, size_t text_len, const char *name) {
+    size_t n = strlen(name);
+    for (size_t i = 0; i + n <= text_len; i++) {
+        if (strncmp(text + i, name, n) == 0 &&
+            (i == 0 || !(isalnum((unsigned char)text[i - 1]) || text[i - 1] == '_')) &&
+            (i + n == text_len ||
+             !(isalnum((unsigned char)text[i + n]) || text[i + n] == '_'))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when an item or `use` in a scope enclosing `node` (the file or an
+ * inline module around it) introduces the name `name`, so a bare `name`
+ * there may not be the prelude's marker trait. */
+static bool rust_name_shadowed(TSNode node, const char *source, const char *name) {
+    for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
+         scope = ts_node_parent(scope)) {
+        const char *kind = ts_node_type(scope);
+        if (strcmp(kind, "source_file") != 0 && strcmp(kind, "declaration_list") != 0) {
+            continue;
+        }
+        uint32_t nc = ts_node_named_child_count(scope);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode item = ts_node_named_child(scope, i);
+            TSNode text = item;
+            if (strcmp(ts_node_type(item), "use_declaration") != 0) {
+                text = ts_node_child_by_field_name(item, TS_FIELD("name"));
+                if (ts_node_is_null(text)) {
+                    continue;
+                }
+            }
+            uint32_t start = ts_node_start_byte(text);
+            if (rust_text_has_ident(source + start, ts_node_end_byte(text) - start, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* True when the bound `b` (one child of a trait_bounds list) is a lifetime,
- * `?Sized`, or one of the auto and marker traits Send, Sync, Unpin, Sized,
- * written bare or as a path. */
+ * `?Sized`, or one of the marker traits Send, Sync, Unpin, Sized written bare
+ * (and not shadowed by an item or `use` of that name in an enclosing scope)
+ * or as `core::marker::X` / `std::marker::X`. Any other path is a real bound. */
 static bool rust_bound_is_auto(TSNode b, const char *source) {
     const char *kind = ts_node_type(b);
     if (strcmp(kind, "lifetime") == 0 || strcmp(kind, "removed_trait_bound") == 0) {
         return true;
     }
-    if (strcmp(kind, "scoped_type_identifier") == 0) {
-        b = ts_node_child_by_field_name(b, TS_FIELD("name"));
-        kind = ts_node_is_null(b) ? "" : ts_node_type(b);
+    TSNode name = b;
+    bool qualified = strcmp(kind, "scoped_type_identifier") == 0;
+    if (qualified) {
+        TSNode path = ts_node_child_by_field_name(b, TS_FIELD("path"));
+        uint32_t start = ts_node_is_null(path) ? 0 : ts_node_start_byte(path);
+        size_t len = ts_node_is_null(path) ? 0 : (size_t)(ts_node_end_byte(path) - start);
+        static const char *const markers[] = {"core::marker", "std::marker", "::core::marker",
+                                              "::std::marker", NULL};
+        bool marker = false;
+        for (const char *const *m = markers; *m && !marker; m++) {
+            marker = strlen(*m) == len && strncmp(source + start, *m, len) == 0;
+        }
+        if (!marker) {
+            return false;
+        }
+        name = ts_node_child_by_field_name(b, TS_FIELD("name"));
+        kind = ts_node_is_null(name) ? "" : ts_node_type(name);
     }
     if (strcmp(kind, "type_identifier") != 0) {
         return false;
     }
     static const char *const autos[] = {"Send", "Sync", "Unpin", "Sized", NULL};
-    uint32_t start = ts_node_start_byte(b);
-    size_t len = (size_t)(ts_node_end_byte(b) - start);
+    uint32_t start = ts_node_start_byte(name);
+    size_t len = (size_t)(ts_node_end_byte(name) - start);
     for (const char *const *a = autos; *a; a++) {
         if (strlen(*a) == len && strncmp(source + start, *a, len) == 0) {
-            return true;
+            return qualified || !rust_name_shadowed(b, source, *a);
         }
     }
     return false;

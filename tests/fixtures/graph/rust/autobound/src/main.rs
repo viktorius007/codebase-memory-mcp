@@ -26,6 +26,17 @@ impl<T> Keyed<T> where T: Sync + ?Sized {
 }
 pub fn with_keyed<T: Sync, F: FnOnce(&Keyed<T>) -> u8>(f: F) -> u8 { f(&Keyed { marker: PhantomData }) }
 
+pub mod custom {
+    pub trait Send {}
+    impl Send for u32 {}
+}
+
+pub struct Guarded<T> { marker: PhantomData<T> }
+impl<T: custom::Send> Guarded<T> {
+    pub fn guard(&self) -> u8 { println!("Guarded::guard\n{}", std::backtrace::Backtrace::force_capture()); 2 }
+}
+pub fn with_guarded<T: custom::Send, F: FnOnce(&Guarded<T>) -> u8>(f: F) -> u8 { f(&Guarded { marker: PhantomData }) }
+
 fn main() {
     let pool = Pool;
     let out = pool.scope(|scope| {
@@ -34,5 +45,6 @@ fn main() {
         }
     });
     let k = with_keyed::<u32, _>(|keyed| keyed.key());
-    let _ = (out, k);
+    let g = with_guarded::<u32, _>(|guarded| guarded.guard());
+    let _ = (out, k, g);
 }
