@@ -1898,11 +1898,18 @@ static const CLambdaCapture *c_lambda_capture_types(CLSPContext *ctx, TSNode lis
     return found;
 }
 
-/* Whether text, ignoring blanks, is exactly want. */
+/* Whether text, ignoring blanks and comments, is exactly want. */
 static bool c_text_is_compact(const char *text, const char *want) {
     if (!text)
         return false;
     for (; *text; text++) {
+        if (text[0] == '/' && (text[1] == '*' || text[1] == '/')) {
+            const char *end = text[1] == '*' ? strstr(text + 2, "*/") : strchr(text, '\n');
+            if (!end)
+                return false;
+            text = text[1] == '*' ? end + 1 : end;
+            continue;
+        }
         if (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r')
             continue;
         if (*text != *want)
@@ -1934,10 +1941,9 @@ static bool c_is_void_cast(CLSPContext *ctx, TSNode expr) {
 
 /* Whether some name in expr that frame binds to an unknown type can decide
  * expr's type. Every subexpression is assumed to be able to (an operand may
- * pick an overloaded operator, a conversion or an overload), except two that
- * provably cannot: the operand of sizeof/alignof (the result is size_t) and
- * the left operand of a comma when that operand is a cast to void (the
- * built-in comma then applies and yields the right operand). */
+ * pick an overloaded operator, a conversion or an overload), except one that
+ * provably cannot: the left operand of a comma when that operand is a cast
+ * to void (the built-in comma then applies and yields the right operand). */
 static bool c_unknown_local_decides(CLSPContext *ctx, const CBMScope *frame, TSNode expr) {
     if (ts_node_is_null(expr))
         return false;
@@ -1947,8 +1953,6 @@ static bool c_unknown_local_decides(CLSPContext *ctx, const CBMScope *frame, TSN
         const CBMVarBinding *b = name ? cbm_scope_lookup_local(frame, name) : NULL;
         return b && cbm_type_is_unknown(b->type);
     }
-    if (strcmp(kind, "sizeof_expression") == 0 || strcmp(kind, "alignof_expression") == 0)
-        return false;
     TSNode skip = (TSNode){0};
     if (strcmp(kind, "comma_expression") == 0) {
         TSNode left = ts_node_child_by_field_name(expr, "left", 4);
@@ -3000,10 +3004,17 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
 
     // --- conditional_expression: a ? b : c ---
     if (strcmp(kind, "conditional_expression") == 0) {
+        /* Proven only when both branches have the same proven type: with
+         * different ones a conversion of either decides the result. */
         TSNode consequence = ts_node_child_by_field_name(node, "consequence", 11);
-        if (!ts_node_is_null(consequence))
-            return c_eval_expr_type(ctx, consequence);
-        return cbm_type_unknown();
+        TSNode alternative = ts_node_child_by_field_name(node, "alternative", 11);
+        if (ts_node_is_null(consequence) || ts_node_is_null(alternative))
+            return cbm_type_unknown();
+        const CBMType *then_type = c_eval_expr_type(ctx, consequence);
+        if (cbm_type_is_unknown(then_type))
+            return then_type;
+        const CBMType *else_type = c_eval_expr_type(ctx, alternative);
+        return cbm_type_equal(then_type, else_type) ? then_type : cbm_type_unknown();
     }
 
     // --- parenthesized_expression: (expr) ---

@@ -39,6 +39,10 @@ int main() {
     conditional(Outer{}).run(); // Outer::run (resolver: unknown, no link)
     auto comma = [](auto w) { return (w, Inner{}); };
     comma(Outer{}).run(); // Outer::run via operator, (resolver: unknown, no link)
+    auto sized = [](auto w) { return sizeof(w) > 4 ? Inner{} : Outer{}; };
+    sized(0).run(); // Outer::run: the conditional converts Inner (resolver: unknown, no link)
+    auto commented = [](auto w) { return (static_cast</* c */ void>(w), Inner{}); };
+    commented(0).run(); // Inner::run
     w.run();               // Outer::run
     v.run();               // Outer::run
     c.run();               // Outer::run
