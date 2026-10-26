@@ -237,4 +237,13 @@ int cbm_rust_modtree_use_items_at(const CBMRustModTree *tree, CBMArena *arena, c
                                   uint32_t offset, const char *local_name, const char *path,
                                   const char **out_qns, int max);
 
+/* The value `V` of `type name = V;` written in the project's trait impls for
+ * the project type `self_qn` (`impl Trait for Self { type name = V; }`), as
+ * written, with `*out_module_qn` the physical module of the impl. Only impls
+ * without type or const parameters count. NULL when none writes it, or when
+ * two write different values (cfg twins, two traits with the same name). */
+const char *cbm_rust_modtree_impl_assoc_type(const CBMRustModTree *tree, CBMArena *arena,
+                                             const char *self_qn, const char *name,
+                                             const char **out_module_qn);
+
 #endif /* CBM_LSP_RUST_MODTREE_H */

@@ -5497,6 +5497,8 @@ static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMTyp
                                                const CBMType *const *args, int argc,
                                                const CBMType *self_t, int depth);
 
+static const char *rust_projection_name(const CBMType *t, const char **head, size_t *head_len);
+
 /* True when `t` spells one of `inf`'s parameters, or `Self` when `self` is set. */
 static bool rust_type_spells_param(RustLSPContext *ctx, const RustCallInference *inf,
                                    const CBMType *t, bool self, int depth) {
@@ -5505,6 +5507,15 @@ static bool rust_type_spells_param(RustLSPContext *ctx, const RustCallInference 
     }
     if (rust_receiver_param_index(ctx, t, inf->names, inf->count) >= 0) {
         return true;
+    }
+    const char *head = NULL;
+    size_t head_len = 0;
+    if (rust_projection_name(t, &head, &head_len)) {
+        for (int i = 0; i < inf->count; i++) {
+            if (strlen(inf->names[i]) == head_len && strncmp(inf->names[i], head, head_len) == 0) {
+                return true;
+            }
+        }
     }
     switch (t->kind) {
     case CBM_TYPE_NAMED:
@@ -7166,6 +7177,71 @@ static int rust_receiver_param_index(RustLSPContext *ctx, const CBMType *t,
 
 enum { RUST_RECEIVER_SUBST_MAX_DEPTH = 16 };
 
+/* The written name of a projection `P::Name` (a NAMED or TEMPLATE type
+ * spelled `P.Name`, P one segment), else NULL; `*head` and `*head_len` then
+ * give P. */
+static const char *rust_projection_name(const CBMType *t, const char **head, size_t *head_len) {
+    const char *qn = !t                            ? NULL
+                     : t->kind == CBM_TYPE_NAMED    ? t->data.named.qualified_name
+                     : t->kind == CBM_TYPE_TEMPLATE ? t->data.template_type.template_name
+                                                    : NULL;
+    const char *dot = qn ? strchr(qn, '.') : NULL;
+    if (!dot || dot == qn || !dot[1] || strchr(dot + 1, '.')) {
+        return NULL;
+    }
+    *head = qn;
+    *head_len = (size_t)(dot - qn);
+    return dot + 1;
+}
+
+/* `<self_t as Trait>::name` read through the project's trait impls for
+ * self_t's type: the type their `type name = V;` writes, resolved where the
+ * impl stands. NULL when self_t is no project type the tree knows (a
+ * reference, a parameter, a std type), or no impl, or two impls with
+ * different values, write it. */
+static const CBMType *rust_project_impl_assoc(RustLSPContext *ctx, const CBMType *self_t,
+                                              const char *name) {
+    const char *self_qn = !self_t                            ? NULL
+                          : self_t->kind == CBM_TYPE_NAMED    ? self_t->data.named.qualified_name
+                          : self_t->kind == CBM_TYPE_TEMPLATE ? self_t->data.template_type.template_name
+                                                              : NULL;
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const char *module = NULL;
+    const char *value = self_qn && tree ? cbm_rust_modtree_impl_assoc_type(
+                                              tree, ctx->arena, self_qn, name, &module)
+                                             : NULL;
+    if (!value) {
+        return NULL;
+    }
+    const CBMType *t = rust_parse_def_type_text(ctx->arena, value, module, tree);
+    return t && !cbm_type_is_unknown(t) ? t : NULL;
+}
+
+/* The projection `P::Name` with P one of `params` bound to a known
+ * argument, or `Self::Name` with `self_t` given, read through the impl of
+ * that type; NULL when `t` is no such projection or the impl does not settle it. */
+static const CBMType *rust_subst_projection(RustLSPContext *ctx, const CBMType *t,
+                                            const char *const *params,
+                                            const CBMType *const *args, int argc,
+                                            const CBMType *self_t) {
+    const char *head = NULL;
+    size_t head_len = 0;
+    const char *name = rust_projection_name(t, &head, &head_len);
+    if (!name) {
+        return NULL;
+    }
+    if (self_t && head_len == 4 && strncmp(head, "Self", 4) == 0) {
+        return rust_project_impl_assoc(ctx, self_t, name);
+    }
+    for (int i = 0; i < argc && params && params[i]; i++) {
+        if (args[i] && strlen(params[i]) == head_len && strncmp(params[i], head, head_len) == 0) {
+            return cbm_type_is_unknown(args[i]) ? NULL
+                                                : rust_project_impl_assoc(ctx, args[i], name);
+        }
+    }
+    return NULL;
+}
+
 /* `t` read through a receiver written with type arguments: each of the
  * declaring item's positional `params` is replaced by the argument at its
  * position, and `Self` by `self_t` when given. A parameter past the written
@@ -7180,6 +7256,10 @@ static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMTyp
     int at = rust_receiver_param_index(ctx, t, params, argc);
     if (at >= 0) {
         return args[at];
+    }
+    const CBMType *projected = rust_subst_projection(ctx, t, params, args, argc, self_t);
+    if (projected) {
+        return projected;
     }
     switch (t->kind) {
     case CBM_TYPE_NAMED:

@@ -114,6 +114,20 @@ typedef struct {
     uint8_t prelude_restrictions;
 } RmtFile;
 
+/* `type name = value;` written in `impl Trait for SelfPath { .. }` of a
+ * module, for an impl that declares no type or const parameters. `self_qn`
+ * is the project type SelfPath names, filled when the tree is finished;
+ * `ambiguous` marks the first entry of a key that another entry gives a
+ * different value. */
+typedef struct {
+    int module;
+    const char *self_path;
+    const char *name;
+    const char *value;
+    const char *self_qn;
+    bool ambiguous;
+} RmtImplAssoc;
+
 /* Read-only lookup over a finished tree for trait-in-scope queries. `bound`
  * groups the entries such a query can accept (not named `_`, binding a type
  * with a QN) by the trait identity rmt_trait_identity_equal compares; `anon`
@@ -150,6 +164,9 @@ struct CBMRustModTree {
     CBMIdxMemo externs;   /* "<crate>\x1f<name>" -> target crate + 1, 0 = outside project */
     CBMIdxMemo use_heads; /* "<module>\x1f<head>" -> 1 when a `use` declared there starts so */
     RmtTraitIndex trait_index;
+    RmtImplAssoc *impl_assocs; /* associated types written in trait impls */
+    int impl_assoc_count, impl_assoc_cap;
+    CBMIdxMemo impl_assoc_by_self; /* "<self QN>\x1f<name>" -> first impl_assocs entry */
 };
 
 typedef struct {
@@ -211,6 +228,7 @@ void cbm_rust_modtree_free(CBMRustModTree *tree) {
     cbm_free(CBM_MEM_CLASS_OTHER, tree->modules);
     cbm_free(CBM_MEM_CLASS_OTHER, tree->entries);
     cbm_free(CBM_MEM_CLASS_OTHER, tree->imports);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->impl_assocs);
     cbm_arena_destroy(&tree->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, tree);
 }
@@ -589,6 +607,7 @@ typedef enum {
     RMF_MACRO_MOD, /* `mod name;` written in an unexpanded item macro's braces */
     RMF_PRELUDE,   /* item: standard-prelude restriction bits */
     RMF_MACRO_EXPORT, /* `#[macro_export] macro_rules! name`: an item of the crate root */
+    RMF_IMPL_ASSOC, /* `type name = text;` in a trait impl for the type path `self_path` */
 } RmfOp;
 
 typedef struct {
@@ -605,6 +624,7 @@ typedef struct {
     /* conditional records: the item's `#[cfg(..)]` predicates joined as
      * `all(..)`, NULL when another attribute (cfg_attr) also gates it */
     const char *cfg;
+    const char *self_path; /* RMF_IMPL_ASSOC: the impl's self type path, without arguments */
 } RmfRecord;
 
 struct CBMRustModFacts {
@@ -962,6 +982,59 @@ static bool rmf_has_attribute(RmfScan *scan, TSNode item, const char *name) {
     return false;
 }
 
+/* True when the impl declares a type or const parameter: an associated type
+ * it writes may then depend on what the parameter is bound to. */
+static bool rmf_impl_has_type_params(TSNode impl) {
+    TSNode params = ts_node_child_by_field_name(impl, "type_parameters", 15);
+    uint32_t count = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *kind = ts_node_type(ts_node_named_child(params, i));
+        if (strcmp(kind, "lifetime") != 0 && strcmp(kind, "lifetime_parameter") != 0 &&
+            strcmp(kind, "line_comment") != 0 && strcmp(kind, "block_comment") != 0)
+            return true;
+    }
+    return false;
+}
+
+/* The path an impl's self type names, without generic arguments; NULL for a
+ * reference, slice, array, tuple or any other self type that is no path. */
+static TSNode rmf_impl_self_path(TSNode impl) {
+    TSNode self = ts_node_child_by_field_name(impl, "type", 4);
+    if (!ts_node_is_null(self) && strcmp(ts_node_type(self), "generic_type") == 0)
+        self = ts_node_child_by_field_name(self, "type", 4);
+    const char *kind = ts_node_is_null(self) ? "" : ts_node_type(self);
+    TSNode none = {0};
+    return strcmp(kind, "type_identifier") == 0 || strcmp(kind, "scoped_type_identifier") == 0
+               ? self : none;
+}
+
+/* Each `type name = value;` of a trait impl without type parameters whose
+ * self type is a path. */
+static void rmf_scan_impl(RmfScan *scan, TSNode impl) {
+    TSNode body = ts_node_child_by_field_name(impl, "body", 4);
+    TSNode self = rmf_impl_self_path(impl);
+    if (ts_node_is_null(body) || ts_node_is_null(self) ||
+        ts_node_is_null(ts_node_child_by_field_name(impl, "trait", 5)) ||
+        rmf_impl_has_type_params(impl))
+        return;
+    const char *self_path = cbm_node_text(&scan->facts->arena, self, scan->source);
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count && !scan->failed; i++) {
+        TSNode member = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(member), "type_item") != 0)
+            continue;
+        TSNode name = ts_node_child_by_field_name(member, "name", 4);
+        TSNode value = ts_node_child_by_field_name(member, "type", 4);
+        if (ts_node_is_null(name) || ts_node_is_null(value))
+            continue;
+        rmf_push(scan, (RmfRecord){.op = RMF_IMPL_ASSOC,
+                                   .self_path = self_path,
+                                   .name = cbm_node_text(&scan->facts->arena, name, scan->source),
+                                   .text = cbm_node_text(&scan->facts->arena, value,
+                                                         scan->source)});
+    }
+}
+
 static void rmf_scan_item(RmfScan *scan, TSNode item) {
     const char *kind = ts_node_type(item);
     if (rmf_scan_proc_macro(scan, item))
@@ -977,6 +1050,8 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
                                        .start = ts_node_start_byte(item),
                                        .name = cbm_node_text(&scan->facts->arena, name,
                                                              scan->source)});
+    } else if (strcmp(kind, "impl_item") == 0) {
+        rmf_scan_impl(scan, item);
     } else if (strcmp(kind, "mod_item") == 0) {
         rmf_scan_mod(scan, item);
     } else if (strcmp(kind, "use_declaration") == 0) {
@@ -1296,6 +1371,16 @@ static RmtCfg rmt_record_cfg(const CBMRustModTree *tree, int crate, const RmfRec
     return parse.failed || *parse.at ? RMT_CFG_UNKNOWN : value;
 }
 
+static int rmt_add_impl_assoc(CBMRustModTree *tree, int module, const RmfRecord *record) {
+    RMT_GROW(tree, impl_assocs, impl_assoc_count, impl_assoc_cap);
+    tree->impl_assocs[tree->impl_assoc_count++] = (RmtImplAssoc){
+        .module = module,
+        .self_path = cbm_arena_strdup(&tree->arena, record->self_path),
+        .name = cbm_arena_strdup(&tree->arena, record->name),
+        .value = cbm_arena_strdup(&tree->arena, record->text)};
+    return 0;
+}
+
 static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, int at, int module,
                            const char *child_dir, bool inline_scope, int depth) {
     CBMRustModTree *tree = build->tree;
@@ -1352,6 +1437,10 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             tree->entries[tree->entry_count - 1].def.conditional = record->conditional;
             break;
         }
+        case RMF_IMPL_ASSOC:
+            if (rmt_record_cfg(tree, build->crate, record) != RMT_CFG_FALSE)
+                rmt_add_impl_assoc(tree, module, record);
+            break;
         case RMF_MACRO:
             tree->modules[module].macro_items = true;
             break;
@@ -1462,6 +1551,19 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
             rmt_digest_str(d, "use");
             rmt_digest_node(d, rmt_visibility_node(item));
             rmt_digest_node(d, ts_node_child_by_field_name(item, "argument", 8));
+        } else if (strcmp(kind, "impl_item") == 0) {
+            /* rmf_scan_impl reads the header and the associated types. */
+            rmt_digest_str(d, "impl");
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "type_parameters", 15));
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "trait", 5));
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "type", 4));
+            TSNode body = ts_node_child_by_field_name(item, "body", 4);
+            uint32_t members = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+            for (uint32_t m = 0; m < members; m++) {
+                TSNode member = ts_node_named_child(body, m);
+                if (strcmp(ts_node_type(member), "type_item") == 0)
+                    rmt_digest_node(d, member);
+            }
         } else if (strcmp(kind, "extern_crate_declaration") == 0) {
             rmt_digest_str(d, "extern");
             rmt_digest_node(d, item);
@@ -2009,6 +2111,7 @@ int cbm_rust_modtree_file_count(const CBMRustModTree *tree) {
 }
 
 static void rmt_trait_index_build(CBMRustModTree *tree);
+static void rmt_impl_assoc_index_build(CBMRustModTree *tree);
 
 static bool rmt_extern_prelude(CBMRustModTree *tree, int crate, const char *name,
                                RmtDef *out, bool building);
@@ -2109,6 +2212,7 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
     }
     /* Built here, before any reader sees the tree, so readers share it unlocked. */
     rmt_trait_index_build(tree);
+    rmt_impl_assoc_index_build(tree);
 }
 
 /* ── Queries ──────────────────────────────────────────────────────── */
@@ -2888,4 +2992,44 @@ int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, cons
         }
     }
     return any ? rmt_use_emit(tree, &agreed, out_qns, max) : -1;
+}
+
+/* ── Associated types of trait impls ──────────────────────────────── */
+
+/* Resolve every impl's self path in its module and index the entries by
+ * (self QN, name). A key two entries give different values (cfg twins, two
+ * traits declaring the same associated name) is ambiguous. */
+static void rmt_impl_assoc_index_build(CBMRustModTree *tree) {
+    for (int i = 0; i < tree->impl_assoc_count; i++) {
+        RmtImplAssoc *entry = &tree->impl_assocs[i];
+        CBMRustPathResult self = cbm_rust_modtree_resolve_type_in_file(
+            tree, &tree->arena, tree->modules[entry->module].qn, entry->self_path);
+        if (self.kind != CBM_RUST_PATH_TYPE || self.is_trait || !self.qn)
+            continue;
+        entry->self_qn = self.qn;
+        const char *key = cbm_arena_sprintf(&tree->arena, "%s\x1f%s", self.qn, entry->name);
+        int32_t first = cbm_idxmemo_get(&tree->impl_assoc_by_self, key);
+        if (first < 0) {
+            cbm_idxmemo_put_if_absent(&tree->impl_assoc_by_self, &tree->arena, key, i);
+            continue;
+        }
+        RmtImplAssoc *seen = &tree->impl_assocs[first];
+        if (strcmp(seen->value, entry->value) != 0 ||
+            strcmp(tree->modules[seen->module].qn, tree->modules[entry->module].qn) != 0)
+            seen->ambiguous = true;
+    }
+}
+
+const char *cbm_rust_modtree_impl_assoc_type(const CBMRustModTree *tree, CBMArena *arena,
+                                             const char *self_qn, const char *name,
+                                             const char **out_module_qn) {
+    if (!tree || !self_qn || !name)
+        return NULL;
+    const char *key = cbm_arena_sprintf(arena, "%s\x1f%s", self_qn, name);
+    int32_t at = key ? cbm_idxmemo_get(&tree->impl_assoc_by_self, key) : -1;
+    if (at < 0 || tree->impl_assocs[at].ambiguous)
+        return NULL;
+    if (out_module_qn)
+        *out_module_qn = tree->modules[tree->impl_assocs[at].module].qn;
+    return tree->impl_assocs[at].value;
 }
