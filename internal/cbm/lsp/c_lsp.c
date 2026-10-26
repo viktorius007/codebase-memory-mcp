@@ -1898,12 +1898,73 @@ static const CLambdaCapture *c_lambda_capture_types(CLSPContext *ctx, TSNode lis
     return found;
 }
 
-/* The frame of the lambda whose return operand is being typed, NULL outside
- * that typing. A name this frame binds to an unknown type (an `auto`
- * parameter of a generic lambda) evaluates to unknown: it hides every outer
- * name of the same spelling, so neither the enclosing scope nor the registry
- * may type it. Thread-local because files are resolved in parallel. */
-static _Thread_local const CBMScope *c_lambda_infer_frame;
+/* Whether text, ignoring blanks, is exactly want. */
+static bool c_text_is_compact(const char *text, const char *want) {
+    if (!text)
+        return false;
+    for (; *text; text++) {
+        if (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r')
+            continue;
+        if (*text != *want)
+            return false;
+        want++;
+    }
+    return *want == '\0';
+}
+
+/* Whether expr is a cast to void: `(void)e` or `static_cast<void>(e)`. A
+ * void operand cannot select an overloaded operator, since no function
+ * parameter has type void. */
+static bool c_is_void_cast(CLSPContext *ctx, TSNode expr) {
+    while (strcmp(ts_node_type(expr), "parenthesized_expression") == 0 &&
+           ts_node_named_child_count(expr) > 0)
+        expr = ts_node_named_child(expr, 0);
+    const char *kind = ts_node_type(expr);
+    if (strcmp(kind, "cast_expression") == 0) {
+        TSNode type = ts_node_child_by_field_name(expr, "type", 4);
+        return !ts_node_is_null(type) && c_text_is_compact(c_node_text(ctx, type), "void");
+    }
+    if (strcmp(kind, "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(expr, "function", 8);
+        return !ts_node_is_null(fn) &&
+               c_text_is_compact(c_node_text(ctx, fn), "static_cast<void>");
+    }
+    return false;
+}
+
+/* Whether some name in expr that frame binds to an unknown type can decide
+ * expr's type. Every subexpression is assumed to be able to (an operand may
+ * pick an overloaded operator, a conversion or an overload), except two that
+ * provably cannot: the operand of sizeof/alignof (the result is size_t) and
+ * the left operand of a comma when that operand is a cast to void (the
+ * built-in comma then applies and yields the right operand). */
+static bool c_unknown_local_decides(CLSPContext *ctx, const CBMScope *frame, TSNode expr) {
+    if (ts_node_is_null(expr))
+        return false;
+    const char *kind = ts_node_type(expr);
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = c_node_text(ctx, expr);
+        const CBMVarBinding *b = name ? cbm_scope_lookup_local(frame, name) : NULL;
+        return b && cbm_type_is_unknown(b->type);
+    }
+    if (strcmp(kind, "sizeof_expression") == 0 || strcmp(kind, "alignof_expression") == 0)
+        return false;
+    TSNode skip = (TSNode){0};
+    if (strcmp(kind, "comma_expression") == 0) {
+        TSNode left = ts_node_child_by_field_name(expr, "left", 4);
+        if (!ts_node_is_null(left) && c_is_void_cast(ctx, left))
+            skip = left;
+    }
+    uint32_t nc = ts_node_named_child_count(expr);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_named_child(expr, i);
+        if (!ts_node_is_null(skip) && ts_node_eq(child, skip))
+            continue;
+        if (c_unknown_local_decides(ctx, frame, child))
+            return true;
+    }
+    return false;
+}
 
 /* The identifier a declarator declares, or a null node (an abstract
  * declarator, an operator name). */
@@ -1978,9 +2039,10 @@ static void c_lambda_bind_names(CLSPContext *ctx, TSNode declarator, TSNode body
 /* The return type of a lambda without a trailing return type: the type of its
  * first immediate `return` operand, evaluated in the lambda's own scope. The
  * operand sees the lambda's init-captures, parameters and the body's earlier
- * declarations, not same-named variables of the enclosing function. A name
- * the lambda binds to an unknown type (an `auto` parameter of a generic
- * lambda) makes the result unknown. */
+ * declarations, not same-named variables of the enclosing function. When a
+ * name the lambda binds to an unknown type (an `auto` parameter of a generic
+ * lambda) can decide the operand's type (c_unknown_local_decides), the result
+ * is unknown and no link is made from it. */
 static const CBMType *c_lambda_body_return_type(CLSPContext *ctx, TSNode node,
                                                 TSNode declarator) {
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
@@ -2004,10 +2066,9 @@ static const CBMType *c_lambda_body_return_type(CLSPContext *ctx, TSNode node,
     for (uint32_t i = 0; i < capture_count; i++)
         cbm_scope_bind(ctx->current_scope, captures[i].name, captures[i].type);
     c_lambda_bind_names(ctx, declarator, body, ri);
-    const CBMScope *saved_frame = c_lambda_infer_frame;
-    c_lambda_infer_frame = ctx->current_scope;
-    const CBMType *ret = c_eval_expr_type(ctx, ret_expr);
-    c_lambda_infer_frame = saved_frame;
+    const CBMType *ret = NULL;
+    if (!c_unknown_local_decides(ctx, ctx->current_scope, ret_expr))
+        ret = c_eval_expr_type(ctx, ret_expr);
     ctx->current_scope = saved_scope;
     ctx->fp_count = saved_fp_count;
     return ret;
@@ -2023,12 +2084,8 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
             return cbm_type_unknown();
 
         // Scope lookup
-        const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
-        const CBMType *t = binding ? binding->type : cbm_type_unknown();
+        const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
         if (!cbm_type_is_unknown(t))
-            return t;
-        if (binding && c_lambda_infer_frame &&
-            binding == cbm_scope_lookup_local(c_lambda_infer_frame, name))
             return t;
 
         // Check if it's a registered function (before type check — functions

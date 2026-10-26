@@ -4,13 +4,17 @@
 // class named in the comment.
 #include <cstdio>
 
-struct Inner {
-    int run() { return std::puts("Inner::run"); }
-};
-
 struct Outer {
     int run() { return std::puts("Outer::run"); }
 };
+
+struct Inner {
+    int run() { return std::puts("Inner::run"); }
+    operator Outer() const { return Outer{}; }
+};
+
+// An overloaded comma: `(Outer, Inner)` yields Outer, not the right operand.
+Outer operator,(Outer, Inner) { return Outer{}; }
 
 int main() {
     Outer w;
@@ -31,6 +35,10 @@ int main() {
     defaulted().run(); // Inner::run
     auto discarded = [](auto w) { return (static_cast<void>(w), Inner{}); };
     discarded(0).run(); // Inner::run (the comma's right operand decides)
+    auto conditional = [](auto w) { return true ? Inner{} : w; };
+    conditional(Outer{}).run(); // Outer::run (resolver: unknown, no link)
+    auto comma = [](auto w) { return (w, Inner{}); };
+    comma(Outer{}).run(); // Outer::run via operator, (resolver: unknown, no link)
     w.run();               // Outer::run
     v.run();               // Outer::run
     c.run();               // Outer::run
