@@ -3965,6 +3965,7 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
                     "pub fn borrowed<T: Borrow<Item>>(x: &T) { x.value().act(); }\n"
                     "pub fn dependent<T: Make<Item>>(x: &T) { x.value().item().act(); }\n"
                     "pub fn repeated<T: MakePair<u8, u8>>(x: &T) { x.pair().pair_act(); }\n"
+                    "pub fn repeated_mixed<T: MakePair<u8, u16>>(x: &T) { x.pair().pair_act(); }\n"
                     "pub fn split<T: Split<Item>>(x: &T) { let (_, c) = x.parts(); c.act(); }\n"
                     "pub fn method<M: Method>(x: &M) { x.wrap::<Item>().act(); }\n"
                     "pub fn method_dependent<M: Method>(x: &M) { "
@@ -3977,13 +3978,16 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
         {"borrowed", "act", "src/model.rs", 1, NULL},
         {"dependent", "act", "src/model.rs", 0, NULL},
         {"chain", "chain", "src/model.rs", 1, NULL},
-        {"repeated", "pair_act", "src/model.rs", 0, NULL},
+        /* Pair<u8, u8> fits `impl<T> PairAct for Pair<T, T>`: Rust applies it. */
+        {"repeated", "pair_act", "src/model.rs", 1, NULL},
+        /* Pair<u8, u16> does not: the repeated parameter withholds. */
+        {"repeated_mixed", "pair_act", "src/model.rs", 0, NULL},
         {"split", "act", "src/model.rs", 1, NULL},
         {"method", "act", "src/model.rs", 1, NULL},
         {"method_dependent", "own_act", "src/concrete.rs", 1, NULL},
         {"inferred", "own_act", "src/concrete.rs", 1, NULL},
     };
-    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows, 10);
+    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows, 11);
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/sequential.db", tmp);
     cbm_store_t *store = cbm_store_open_path_query(db_path);
