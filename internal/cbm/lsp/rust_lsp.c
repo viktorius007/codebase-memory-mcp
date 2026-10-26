@@ -11586,7 +11586,12 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         if (string_end > from)
             return string_end;
         if (c == '"' || c == '\'') {
-            return macro_consume_fragment(s, len, from, "literal");
+            int literal_end = macro_consume_fragment(s, len, from, "literal");
+            if (literal_end > from || c == '"')
+                return literal_end;
+            /* A lifetime (`'w`) is one token: the quote and its identifier. */
+            int lifetime_end = macro_consume_ident(s, len, from + 1);
+            return lifetime_end > from + 1 ? lifetime_end : from;
         }
         if (c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '-') {
@@ -12398,6 +12403,200 @@ char *cbm_rust_expand_local_item_macro(CBMArena *arena, const char *source, TSNo
                                       env, NULL, 0);
     cbm_free(CBM_MEM_CLASS_OTHER, env);
     return expanded;
+}
+
+/* The text of the one file-level definition named `name` in `table`, or NULL
+ * when the corpus defines none or several (which one an invocation reaches
+ * would then depend on scope this lookup does not model). */
+static const char *rust_macro_table_unique_text(const CBMRustMacroTable *table, const char *name) {
+    const char *text = NULL;
+    for (int i = 0; i < table->count; i++) {
+        const CBMRustMacroFacts *facts = table->entries[i].facts;
+        for (int d = 0; d < facts->def_count; d++) {
+            if (strcmp(facts->defs[d].name, name) != 0)
+                continue;
+            if (text)
+                return NULL;
+            text = facts->defs[d].text;
+        }
+    }
+    return text;
+}
+
+const char **cbm_rust_deref_macro_names(CBMArena *arena, const CBMRustMacroTable *table) {
+    if (!arena || !table)
+        return NULL;
+    int count = 0;
+    int cap = 0;
+    const char **names = NULL;
+    for (int i = 0; i < table->count; i++) {
+        const CBMRustMacroFacts *facts = table->entries[i].facts;
+        for (int d = 0; d < facts->def_count; d++) {
+            const RustMacroFactDef *def = &facts->defs[d];
+            int len = (int)strlen(def->text);
+            if (!rust_bytes_contain(def->text, len, "Deref for") ||
+                !rust_bytes_contain(def->text, len, "Target") ||
+                rust_macro_table_unique_text(table, def->name) != def->text)
+                continue;
+            if (!rust_macro_facts_reserve(arena, (void **)&names, count, &cap, sizeof(*names)))
+                return NULL;
+            names[count++] = def->name;
+            if (!rust_macro_facts_reserve(arena, (void **)&names, count, &cap, sizeof(*names)))
+                return NULL;
+            names[count] = NULL;
+        }
+    }
+    return names;
+}
+
+/* The first arm of the definition `def_text` whose pattern matches `args`,
+ * substituted; NULL when no arm matches or an arm is beyond the matcher. */
+static char *rust_macro_expand_text(CBMArena *arena, const char *def_text, const char *args,
+                                    int args_len) {
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return NULL;
+    char *expanded = NULL;
+    TSTree *tree = ts_parser_set_language(parser, tree_sitter_rust())
+                       ? ts_parser_parse_string(parser, NULL, def_text, (uint32_t)strlen(def_text))
+                       : NULL;
+    MacroEnv *env = tree ? (MacroEnv *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*env)) : NULL;
+    if (env) {
+        RustLSPContext ctx;
+        rust_lsp_init(&ctx, arena, def_text, (int)strlen(def_text), NULL, NULL, NULL);
+        rust_collect_macro_rules(&ctx, ts_tree_root_node(tree));
+        for (int i = 0; i < ctx.macro_rules_count; i++) {
+            RustMacroRule *r = ctx.macro_rules_arr[i];
+            if (!r->pattern_text || !r->transcriber_text)
+                continue;
+            env->count = 0;
+            env->rep_count = 0;
+            int matched = macro_pattern_match(r->pattern_text, r->pattern_len, args, args_len, env);
+            if (matched == MACRO_UNMODELLED)
+                break;
+            if (matched >= 0) {
+                expanded = macro_substitute(arena, r->transcriber_text, r->transcriber_len, env,
+                                            NULL, 0);
+                break;
+            }
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, env);
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    return expanded;
+}
+
+/* The `type Target = ..;` text of a parsed `impl Deref for ..` item, else NULL. */
+static const char *rust_deref_impl_target(CBMArena *arena, const char *text, TSNode impl) {
+    TSNode trait = ts_node_child_by_field_name(impl, "trait", 5);
+    TSNode body = ts_node_child_by_field_name(impl, "body", 4);
+    const char *trait_text = ts_node_is_null(trait) ? NULL : cbm_node_text(arena, trait, text);
+    if (!trait_text || ts_node_is_null(body) ||
+        strcmp(path_last_segment(trait_text), "Deref") != 0)
+        return NULL;
+    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+        TSNode item = ts_node_named_child(body, i);
+        TSNode name = ts_node_child_by_field_name(item, "name", 4);
+        TSNode type = ts_node_child_by_field_name(item, "type", 4);
+        if (strcmp(ts_node_type(item), "type_item") != 0 || ts_node_is_null(name) ||
+            ts_node_is_null(type))
+            continue;
+        const char *name_text = cbm_node_text(arena, name, text);
+        if (name_text && strcmp(name_text, "Target") == 0)
+            return cbm_node_text(arena, type, text);
+    }
+    return NULL;
+}
+
+/* Append the Deref impls of the expansion `expanded` to `out`. */
+static void rust_collect_expanded_derefs(CBMArena *arena, const char *expanded,
+                                         CBMRustMacroDerefArray *out) {
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return;
+    TSTree *tree = ts_parser_set_language(parser, tree_sitter_rust())
+                       ? ts_parser_parse_string(parser, NULL, expanded, (uint32_t)strlen(expanded))
+                       : NULL;
+    TSNode root = tree ? ts_tree_root_node(tree) : (TSNode){0};
+    for (uint32_t i = 0; !ts_node_is_null(root) && !ts_node_has_error(root) &&
+                         i < ts_node_named_child_count(root);
+         i++) {
+        TSNode impl = ts_node_named_child(root, i);
+        TSNode type = ts_node_child_by_field_name(impl, "type", 4);
+        if (strcmp(ts_node_type(impl), "impl_item") != 0 || ts_node_is_null(type))
+            continue;
+        const char *target = rust_deref_impl_target(arena, expanded, impl);
+        const char *receiver = cbm_node_text(arena, type, expanded);
+        if (!target || !receiver ||
+            !rust_macro_facts_reserve(arena, (void **)&out->items, out->count, &out->cap,
+                                      sizeof(*out->items)))
+            continue;
+        out->items[out->count++] = (CBMRustMacroDeref){.receiver = receiver, .target = target};
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    ts_parser_delete(parser);
+}
+
+/* Whether the file-level `item` carries a `#[cfg ..]` or `#[cfg_attr ..]`. */
+static bool rust_item_is_cfg_gated(const char *source, TSNode item) {
+    return rust_item_has_attribute(source, item, "cfg") ||
+           rust_item_has_attribute(source, item, "cfg_attr");
+}
+
+void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
+                                const char **names, const char *source, int len,
+                                CBMRustMacroDerefArray *out) {
+    if (!arena || !table || !names || !names[0] || !source || len <= 0 || !out)
+        return;
+    bool mentioned = false;
+    for (int n = 0; names[n] && !mentioned; n++) {
+        const char *bang = cbm_arena_sprintf(arena, "%s!", names[n]);
+        mentioned = bang && rust_bytes_contain(source, len, bang);
+    }
+    if (!mentioned)
+        return;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return;
+    TSTree *tree = ts_parser_set_language(parser, tree_sitter_rust())
+                       ? ts_parser_parse_string(parser, NULL, source, (uint32_t)len)
+                       : NULL;
+    TSNode root = tree ? ts_tree_root_node(tree) : (TSNode){0};
+    for (uint32_t i = 0; !ts_node_is_null(root) && i < ts_node_named_child_count(root); i++) {
+        TSNode item = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(item), "expression_statement") == 0 &&
+            ts_node_named_child_count(item) == 1)
+            item = ts_node_named_child(item, 0);
+        TSNode macro = strcmp(ts_node_type(item), "macro_invocation") == 0
+                           ? ts_node_child_by_field_name(item, "macro", 5)
+                           : (TSNode){0};
+        if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "identifier") != 0 ||
+            rust_item_is_cfg_gated(source, item))
+            continue;
+        const char *name = cbm_node_text(arena, macro, source);
+        bool listed = false;
+        for (int n = 0; name && names[n] && !listed; n++)
+            listed = strcmp(names[n], name) == 0;
+        TSNode args_node = rust_macro_argument_node(item);
+        char *args_text = listed && !ts_node_is_null(args_node)
+                              ? cbm_node_text(arena, args_node, source)
+                              : NULL;
+        if (!args_text)
+            continue;
+        const char *args = NULL;
+        int args_len = 0;
+        rust_macro_strip_outer(args_text, (int)strlen(args_text), &args, &args_len);
+        char *expanded = rust_macro_expand_text(
+            arena, rust_macro_table_unique_text(table, name), args, args_len);
+        if (expanded)
+            rust_collect_expanded_derefs(arena, expanded, out);
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    ts_parser_delete(parser);
 }
 
 static bool macro_ident_char(char c) {

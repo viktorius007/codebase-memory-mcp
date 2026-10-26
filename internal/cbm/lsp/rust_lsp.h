@@ -468,6 +468,29 @@ void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
                               CBMRustMacroFacts *facts);
 void cbm_rust_macro_table_free(CBMRustMacroTable *table);
 
+/* One `impl Deref for <receiver> { type Target = <target>; }` that a file-level
+ * invocation of a corpus macro_rules! emits; spellings as the expansion reads. */
+typedef struct {
+    const char *receiver;
+    const char *target;
+} CBMRustMacroDeref;
+typedef struct {
+    CBMRustMacroDeref *items;
+    int count;
+    int cap;
+} CBMRustMacroDerefArray;
+/* NULL-terminated names of the file-level macro_rules! in `table` whose
+ * transcriber writes a Deref impl, each defined exactly once in the corpus
+ * (an invocation of a name defined twice could reach either). Arena-owned;
+ * NULL when there are none. */
+const char **cbm_rust_deref_macro_names(CBMArena *arena, const CBMRustMacroTable *table);
+/* Append to `out` the Deref impls emitted by the file-level, non-cfg-gated
+ * invocations in `source` of the macros `names`, expanded through the first
+ * matching arm of their one corpus definition. Arena-owned strings. */
+void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
+                                const char **names, const char *source, int len,
+                                CBMRustMacroDerefArray *out);
+
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, const char *relative_module_qn,
                                           CBMRustLSPDef *defs, int def_count,
