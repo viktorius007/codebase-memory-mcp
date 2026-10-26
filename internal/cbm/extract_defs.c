@@ -5498,8 +5498,7 @@ static bool rust_text_has_ident(const char *text, size_t text_len, const char *n
     for (size_t i = 0; i + n <= text_len; i++) {
         if (strncmp(text + i, name, n) == 0 &&
             (i == 0 || !(isalnum((unsigned char)text[i - 1]) || text[i - 1] == '_')) &&
-            (i + n == text_len ||
-             !(isalnum((unsigned char)text[i + n]) || text[i + n] == '_'))) {
+            (i + n == text_len || !(isalnum((unsigned char)text[i + n]) || text[i + n] == '_'))) {
             return true;
         }
     }
@@ -10320,8 +10319,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     bool auto_only = !impl_trait &&
                      (ts_node_is_null(params) || rust_bounds_auto_only(params, ctx->source, 0)) &&
                      (ts_node_is_null(where) || rust_bounds_auto_only(where, ctx->source, 0));
-    if (auto_only || (ts_node_is_null(where) && (ts_node_is_null(params) ||
-                                                 !rust_subtree_has_kind(params, "trait_bounds", 0)))) {
+    if (auto_only ||
+        (ts_node_is_null(where) &&
+         (ts_node_is_null(params) || !rust_subtree_has_kind(params, "trait_bounds", 0)))) {
         owner.unbounded_params = owner.type_params;
     }
     uint32_t count = ts_node_child_count(body);
