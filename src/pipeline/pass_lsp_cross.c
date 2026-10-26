@@ -2645,23 +2645,44 @@ static bool pxc_python_submodule_loaded_first(const cbm_gbuf_node_t *owner,
 
 /* Whether something other than `owner`'s own binding can answer `member`
  * when its run leaves the name unbound: a module-level `__getattr__` (PEP
- * 562) its run may leave bound (a later `del __getattr__` removes it; a
- * star import or an any-name binder after that may restore it), or a submodule `member` the import
+ * 562) its run may leave bound (a later `del __getattr__` removes it; an
+ * any-name binder after that may restore it, and so may a star import whose
+ * source is unresolved or may export __getattr__:
+ * pxc_python_star_may_bind_hook), or a submodule `member` the import
  * system loads for `from <package> import <member>`
  * (pxc_python_package_has_submodule). */
-static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
-                                            const cbm_gbuf_node_t *owner,
+/* Whether the star import `fact` of `owner` may bind `__getattr__`: its
+ * source is not a located module with readable facts, or its export set may
+ * hold the name (a literal `__all__` listing it, or an `__all__` that is not
+ * literal); with no `__all__` an underscore name is not exported. */
+static bool pxc_python_star_may_bind_hook(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
+                                          const CBMPyNamespaceFact *fact) {
+    char *file_qn = cbm_pipeline_fqn_compute(pr->project_name, owner->file_path, "__file__");
+    const cbm_gbuf_node_t *star =
+        file_qn ? pxc_python_fact_target(pr->ctx, owner->file_path, file_qn, fact, false) : NULL;
+    pxc_free_fqn(file_qn);
+    CBMPyNamespaceFacts star_facts;
+    if (!pxc_python_module_located(pr->ctx, owner->file_path, fact->relative_level,
+                                   fact->module_name, star) ||
+        !pxc_python_module_facts(pr, pxc_python_owner_module(pr->ctx->gbuf, star), &star_facts))
+        return true;
+    bool known = true;
+    return pxc_python_name_is_exported(&star_facts, "__getattr__", NULL, &known) || !known;
+}
+
+static bool pxc_python_unbound_has_fallback(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
                                             const CBMPyNamespaceFacts *facts, const char *member) {
     bool hook = false; /* the last statement naming __getattr__ leaves it bound */
     for (int i = 0; i < facts->count; i++) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
-        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
+        if ((fact->kind == CBM_PY_NS_IMPORT_STAR &&
+             pxc_python_star_may_bind_hook(pr, owner, fact)) ||
             (fact->local_name && strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0))
             hook = true;
         else if (fact->local_name && strcmp(fact->local_name, "__getattr__") == 0)
             hook = fact->kind != CBM_PY_NS_DELETE;
     }
-    return hook || pxc_python_package_has_submodule(ctx, owner, member);
+    return hook || pxc_python_package_has_submodule(pr->ctx, owner, member);
 }
 
 /* The binding `owner`'s top-level run leaves on `member`: the last statement
@@ -2725,11 +2746,10 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
     if (kept) {
         bool unbound = verdict == PXC_PY_UNBOUND;
         bool only_own = unbound || (verdict == PXC_PY_BOUND && *out == own);
-        verdict =
-            only_own && fits && own &&
-                    !(unbound && pxc_python_unbound_has_fallback(pr->ctx, owner, facts, member))
-                ? PXC_PY_BOUND
-                : PXC_PY_OPAQUE;
+        verdict = only_own && fits && own &&
+                          !(unbound && pxc_python_unbound_has_fallback(pr, owner, facts, member))
+                      ? PXC_PY_BOUND
+                      : PXC_PY_OPAQUE;
         *out = own;
     }
     /* A package binding its own name over a submodule of that name holds it
