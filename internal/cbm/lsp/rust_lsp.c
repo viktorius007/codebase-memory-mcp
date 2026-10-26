@@ -12460,7 +12460,7 @@ static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
                                          env, &sites, (uint32_t)strlen(expand_prefix));
     cbm_free(CBM_MEM_CLASS_OTHER, env);
     if (!substituted)
-        return false;
+        return true; /* the matched rule cannot transcribe: rustc rejects it */
 
     /* Expansion memo (see RustLSPContext.macro_memo): reset per top-level
      * invocation, dedup identical (macro, substituted body) within the
