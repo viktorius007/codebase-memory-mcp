@@ -4930,6 +4930,132 @@ static void pxc_rust_add_package_externs(PXCRustCrates *crates, const PXCRustPac
     }
 }
 
+/* Enabled Cargo features, one set per package. */
+typedef struct {
+    const char **names;
+    int count;
+    int cap;
+} PXCRustFeatureSet;
+
+static bool pxc_rust_feature_set_has(const PXCRustFeatureSet *set, const char *name) {
+    for (int i = 0; i < set->count; i++) {
+        if (strcmp(set->names[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const CBMCargoFeature *pxc_rust_feature(const CBMCargoManifest *m, const char *name) {
+    for (int i = 0; i < m->feature_count; i++) {
+        if (strcmp(m->features[i].name, name) == 0) {
+            return &m->features[i];
+        }
+    }
+    return NULL;
+}
+
+enum { PXC_RUST_FEATURE_MAX_DEPTH = 64 };
+
+/* Enable `name` in package `p` and every feature it lists: a bare name in
+ * the same package, `dep/feature` and `dep?/feature` in the in-project
+ * package that dependency points at. `dep:x` enables no feature. */
+static void pxc_rust_enable_feature(PXCRustCrates *crates, PXCRustFeatureSet *sets, int p,
+                                    const char *name, int depth) {
+    PXCRustFeatureSet *set = &sets[p];
+    const CBMCargoManifest *m = crates->packages[p].manifest;
+    /* A name the table does not declare is an optional dependency's
+     * implicit feature: enabled, listing nothing. */
+    const CBMCargoFeature *feature = pxc_rust_feature(m, name);
+    if (depth > PXC_RUST_FEATURE_MAX_DEPTH || pxc_rust_feature_set_has(set, name)) {
+        return;
+    }
+    if (set->count == set->cap) {
+        int cap = set->cap ? set->cap * 2 : 16;
+        const char **grown = cbm_arena_alloc(crates->arena, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        if (set->count) {
+            memcpy(grown, set->names, (size_t)set->count * sizeof(*grown));
+        }
+        set->names = grown;
+        set->cap = cap;
+    }
+    set->names[set->count++] = name;
+    for (int v = 0; feature && v < feature->value_count; v++) {
+        const char *value = feature->values[v];
+        const char *slash = strchr(value, '/');
+        if (strncmp(value, "dep:", 4) == 0) {
+            continue;
+        }
+        if (!slash) {
+            pxc_rust_enable_feature(crates, sets, p, value, depth + 1);
+            continue;
+        }
+        bool weak = slash > value && slash[-1] == '?';
+        const char *dep_name =
+            cbm_arena_strndup(crates->arena, value, (size_t)(slash - value - (weak ? 1 : 0)));
+        if (!weak) {
+            pxc_rust_enable_feature(crates, sets, p, dep_name, depth + 1);
+        }
+        for (int d = 0; dep_name && d < m->dep_count; d++) {
+            if (!m->deps[d].name || strcmp(m->deps[d].name, dep_name) != 0) {
+                continue;
+            }
+            const char *dir = pxc_rust_dep_dir(crates, &crates->packages[p], &m->deps[d]);
+            int target = dir ? pxc_rust_package_index(crates, dir) : -1;
+            if (target >= 0) {
+                pxc_rust_enable_feature(crates, sets, target, slash + 1, depth + 1);
+            }
+        }
+    }
+}
+
+/* Every package builds with its own default features, unified with every
+ * feature an in-project dependency entry (`features = [..]`, dev and build
+ * dependencies included) or another package's enabled features turn on, as
+ * a workspace build of all targets does. Each crate of a package gets the package's set. */
+static void pxc_rust_set_crate_features(PXCRustCrates *crates, CBMRustModTree *tree) {
+    PXCRustFeatureSet *sets =
+        cbm_arena_calloc(crates->arena, (size_t)(crates->package_count + 1) * sizeof(*sets));
+    if (!sets) {
+        return;
+    }
+    for (int p = 0; p < crates->package_count; p++) {
+        pxc_rust_enable_feature(crates, sets, p, "default", 0);
+        const CBMCargoManifest *m = crates->packages[p].manifest;
+        for (int d = 0; d < m->dep_count; d++) {
+            const CBMCargoDep *dep = &m->deps[d];
+            const char *dir = dep->workspace_table ? NULL
+                                                   : pxc_rust_dep_dir(crates, &crates->packages[p], dep);
+            int target = dir ? pxc_rust_package_index(crates, dir) : -1;
+            for (int f = 0; target >= 0 && f < dep->feature_count; f++) {
+                pxc_rust_enable_feature(crates, sets, target, dep->features[f], 0);
+            }
+            /* `workspace = true` also takes the workspace entry's features. */
+            for (int w = 0; target >= 0 && dep->workspace && crates->root &&
+                            w < crates->root->dep_count; w++) {
+                const CBMCargoDep *ws = &crates->root->deps[w];
+                if (!ws->workspace_table || !ws->name || !dep->name ||
+                    strcmp(ws->name, dep->name) != 0) {
+                    continue;
+                }
+                for (int f = 0; f < ws->feature_count; f++) {
+                    pxc_rust_enable_feature(crates, sets, target, ws->features[f], 0);
+                }
+            }
+        }
+    }
+    for (int p = 0; p < crates->package_count; p++) {
+        const PXCRustPackage *package = &crates->packages[p];
+        for (int c = package->first_crate;
+             c >= 0 && c < package->first_crate + package->crate_count; c++) {
+            cbm_rust_modtree_set_crate_features(tree, c, sets[p].names, sets[p].count);
+        }
+    }
+}
+
 /* Register every target of every package as a crate root, then fill each
  * crate's extern prelude. Target discovery attributes a file to the
  * innermost package directory holding it. */
@@ -4948,6 +5074,7 @@ static void pxc_rust_add_crates(PXCRustCrates *crates, CBMRustModTree *tree) {
     for (int p = 0; p < crates->package_count; p++) {
         pxc_rust_add_package_externs(crates, &crates->packages[p], tree);
     }
+    pxc_rust_set_crate_features(crates, tree);
 }
 
 typedef struct {

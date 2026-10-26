@@ -106,6 +106,13 @@ typedef enum {
 int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
                                const char *extern_name, CBMRustEdition edition);
 
+/* Record the Cargo features enabled for `crate_id`. A crate given a set
+ * decides `#[cfg(feature = "..")]` on its items and `use` declarations:
+ * a false predicate drops the item, a true one makes it unconditional.
+ * Every other cfg predicate stays undecided. */
+void cbm_rust_modtree_set_crate_features(CBMRustModTree *tree, int crate_id,
+                                         const char *const *features, int count);
+
 /* Make `name` visible in `crate_id`'s extern prelude. `target_crate` is the
  * library crate it names, or -1 for a crate outside the project. */
 void cbm_rust_modtree_add_extern(CBMRustModTree *tree, int crate_id, const char *name,

@@ -256,9 +256,45 @@ static int cargo_key_path(CBMArena *arena, const char *s, int len, int from,
  * `dep = { path = ... }`, a `[dependencies.dep]` table): `path` (a local
  * crate) and `workspace = true` (inherited from the workspace root) are kept,
  * any other value skipped. */
+/* A TOML array of strings into `*values` (arena, `*count` entries). A value
+ * that is not such an array is skipped and leaves `*count` at 0. */
+static int parse_string_array(CBMArena *arena, const char *s, int len, int from,
+                              const char ***values, int *count) {
+    *count = 0;
+    if (from >= len || s[from] != '[')
+        return skip_value(s, len, from);
+    int capacity = 0;
+    for (int at = from + 1; at < len && s[at] != ']'; at++)
+        capacity += s[at] == '"' || s[at] == '\'' ? 1 : 0;
+    const char **out = (const char **)cbm_arena_alloc(arena, (size_t)(capacity + 1) * sizeof(*out));
+    if (!out)
+        return skip_value(s, len, from);
+    from++;
+    while (from < len && s[from] != ']') {
+        from = skip_ws_and_comment(s, len, from);
+        if (from < len && (s[from] == '"' || s[from] == '\'')) {
+            const char *value = NULL;
+            from = parse_string(arena, s, len, from, &value);
+            if (value && *count < capacity)
+                out[(*count)++] = value;
+        } else if (from < len && s[from] != ']' && s[from] != ',') {
+            *count = 0;
+            return skip_value(s, len, from);
+        }
+        from = skip_ws_and_comment(s, len, from);
+        if (from < len && s[from] == ',')
+            from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    *values = out;
+    return from < len ? from + 1 : from;
+}
+
 static int parse_dep_field(CBMArena *a, const char *s, int len, int from, const char *field,
                            CBMCargoDep *dep) {
     if (dep && field && strcmp(field, "path") == 0) return parse_string(a, s, len, from, &dep->path);
+    if (dep && field && strcmp(field, "features") == 0)
+        return parse_string_array(a, s, len, from, &dep->features, &dep->feature_count);
     if (dep && field && strcmp(field, "workspace") == 0) {
         bool inherited = false;
         int end = parse_bool(s, len, from, &inherited);
@@ -504,6 +540,57 @@ static int parse_dependency_table_field(CBMArena *arena, const char *source, int
     return parse_dep_field(arena, source, length, from, key, dep);
 }
 
+/* One `[features]` line, `name = ["a", "b/c", "dep:d"]`. A value that is
+ * not an array of strings is skipped and records nothing. */
+static int parse_feature_entry(CBMArena *arena, const char *s, int len, int from,
+                               CBMCargoManifest *out) {
+    const char *name = NULL;
+    from = parse_key(arena, s, len, from, &name);
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] != '=')
+        return from;
+    from = skip_ws_and_comment(s, len, from + 1);
+    if (!name || from >= len || s[from] != '[')
+        return skip_value(s, len, from);
+    if (out->feature_count == out->feature_capacity) {
+        int capacity = out->feature_capacity ? out->feature_capacity * 2 : 16;
+        CBMCargoFeature *grown =
+            (CBMCargoFeature *)cbm_arena_alloc(arena, (size_t)capacity * sizeof(*grown));
+        if (!grown)
+            return skip_value(s, len, from);
+        if (out->feature_count)
+            memcpy(grown, out->features, (size_t)out->feature_count * sizeof(*grown));
+        out->features = grown;
+        out->feature_capacity = capacity;
+    }
+    int value_count = 0;
+    for (int at = from + 1; at < len && s[at] != ']'; at++)
+        value_count += s[at] == ',' || s[at] == '"' ? 1 : 0;
+    const char **values =
+        (const char **)cbm_arena_alloc(arena, (size_t)(value_count + 1) * sizeof(*values));
+    if (!values)
+        return skip_value(s, len, from);
+    CBMCargoFeature *feature = &out->features[out->feature_count++];
+    *feature = (CBMCargoFeature){.name = name, .values = values};
+    from++;
+    while (from < len && s[from] != ']') {
+        from = skip_ws_and_comment(s, len, from);
+        if (from < len && (s[from] == '"' || s[from] == '\'')) {
+            const char *value = NULL;
+            from = parse_string(arena, s, len, from, &value);
+            if (value && feature->value_count < value_count)
+                values[feature->value_count++] = value;
+        } else if (from < len && s[from] != ']' && s[from] != ',') {
+            return skip_value(s, len, from);
+        }
+        from = skip_ws_and_comment(s, len, from);
+        if (from < len && s[from] == ',')
+            from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    return from < len ? from + 1 : from;
+}
+
 void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out) {
     if (!arena || !src || !out) return;
     memset(out, 0, sizeof(*out));
@@ -564,6 +651,7 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
         } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out,
                                             strcmp(section, CARGO_WORKSPACE_DEPS) == 0);
+        else if (strcmp(section, "features") == 0) from = parse_feature_entry(arena, src, src_len, from, out);
         else {
             /* Every other table is skipped, `[patch.<source>]` included: a patch
              * replaces only a dependency from that source whose requirement its
