@@ -1,5 +1,9 @@
 Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
 defects, C/C++: `#line` after same-line comment not blanked,
-preprocessor.cpp). The compiler honours both directives (the program prints
-"main at 951" and "helper at 900"); the graph must report helper at line 8
-and main at line 11 of main.c, the call main -> helper at line 13.
+preprocessor.cpp). The #define makes has_preprocessor_work true, so the file
+takes cbm_preprocess_with_map's simplecpp path and without_line_directives
+runs. The compiler honours both directives (the program prints "main at 951"
+and "helper at 900"). The graph must report helper at line 11 and main at
+line 14 of main.c, and the call main -> helper at line 16. Without the fix,
+simplecpp's expansion carries `#line 900 "gen.y"` / `#line 950 "gen.y"`, and
+build_line_map puts both functions in gen.y at 900+ instead of main.c.
