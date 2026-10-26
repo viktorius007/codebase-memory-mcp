@@ -1341,7 +1341,8 @@ typedef struct {
     bool opaque; /* a where predicate on something other than a parameter */
 } PXCRustWfParams;
 
-/* One trait impl's line span (1-based) and the parameters that need no proof. */
+/* One trait impl's line span (1-based) and the parameters that need no proof
+ * (NULL when the impl gains none). */
 typedef struct {
     uint32_t start_line;
     uint32_t end_line;
@@ -1382,12 +1383,17 @@ static void pxc_rust_wf_add_bounds(CBMArena *arena, PXCRustWfParam *param, TSNod
             param->opaque = true;
             continue;
         }
+        /* A lifetime other than 'static names an item's own lifetime
+         * parameter, which the two items may bind differently. */
+        param->opaque |= bound[0] == '\'' && strcmp(bound, "'static") != 0;
         param->bounds[param->count++] = bound;
     }
 }
 
 /* The type parameters of an item (lifetimes left out, const parameters kept
- * as positions without bounds) with their inline and where-clause bounds. */
+ * as positions without bounds) with their inline and where-clause bounds. A
+ * bounded lifetime parameter or a lifetime where predicate makes the whole
+ * item opaque: it constrains instances beyond what the comparison reads. */
 static void pxc_rust_wf_params(CBMArena *arena, TSNode item, const char *source,
                                PXCRustWfParams *out) {
     memset(out, 0, sizeof(*out));
@@ -1395,8 +1401,10 @@ static void pxc_rust_wf_params(CBMArena *arena, TSNode item, const char *source,
     for (uint32_t i = 0; !ts_node_is_null(list) && i < ts_node_named_child_count(list); i++) {
         TSNode decl = ts_node_named_child(list, i);
         const char *kind = ts_node_type(decl);
-        if (strcmp(kind, "lifetime_parameter") == 0 || strcmp(kind, "lifetime") == 0)
+        if (strcmp(kind, "lifetime_parameter") == 0 || strcmp(kind, "lifetime") == 0) {
+            out->opaque |= ts_node_named_child_count(decl) > 1;
             continue;
+        }
         if (out->count >= PXC_RUST_WF_MAX_PARAMS) {
             out->opaque = true;
             return;
@@ -1424,7 +1432,7 @@ static void pxc_rust_wf_params(CBMArena *arena, TSNode item, const char *source,
         if (param)
             pxc_rust_wf_add_bounds(arena, param,
                                    ts_node_child_by_field_name(predicate, "bounds", 6), source);
-        else if (ts_node_is_null(left) || strcmp(ts_node_type(left), "lifetime") != 0)
+        else
             out->opaque = true;
     }
 }
@@ -1475,13 +1483,21 @@ static bool pxc_rust_wf_bounds_implied(const PXCRustWfParam *impl_param,
     return true;
 }
 
-/* The struct or enum this file declares once under `name`; null otherwise. */
-static TSNode pxc_rust_wf_decl(TSNode root, const char *source, const char *name) {
+/* The struct, enum or union that `impl`'s own module declares once under
+ * `name`, as a sibling item; null otherwise, and for an impl in a block. In
+ * one module scope a path written alike names one item, so the two items'
+ * bounds can be compared as written. */
+static TSNode pxc_rust_wf_decl(TSNode impl, const char *source, const char *name) {
     TSNode found = {0};
     int hits = 0;
-    TSTreeCursor cursor = ts_tree_cursor_new(root);
-    for (bool more = true; more;) {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
+    TSNode scope = ts_node_parent(impl);
+    const char *scope_kind = ts_node_is_null(scope) ? "" : ts_node_type(scope);
+    bool module =
+        strcmp(scope_kind, "source_file") == 0 ||
+        (strcmp(scope_kind, "declaration_list") == 0 && !ts_node_is_null(ts_node_parent(scope)) &&
+         strcmp(ts_node_type(ts_node_parent(scope)), "mod_item") == 0);
+    for (uint32_t i = 0; module && i < ts_node_named_child_count(scope); i++) {
+        TSNode node = ts_node_named_child(scope, i);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "enum_item") == 0 ||
             strcmp(kind, "union_item") == 0) {
@@ -1494,16 +1510,7 @@ static TSNode pxc_rust_wf_decl(TSNode root, const char *source, const char *name
                 hits++;
             }
         }
-        if (ts_tree_cursor_goto_first_child(&cursor))
-            continue;
-        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
-            if (!ts_tree_cursor_goto_parent(&cursor)) {
-                more = false;
-                break;
-            }
-        }
     }
-    ts_tree_cursor_delete(&cursor);
     return hits == 1 ? found : (TSNode){0};
 }
 
@@ -1511,8 +1518,7 @@ static TSNode pxc_rust_wf_decl(TSNode root, const char *source, const char *name
  * unbounded ones, and those the self type's declaration bounds alike at the
  * position where the impl writes the parameter as the whole argument. NULL
  * when the impl has none beyond its unbounded ones or cannot be read. */
-static const char **pxc_rust_wf_impl_params(CBMArena *arena, TSNode root, TSNode impl,
-                                            const char *source) {
+static const char **pxc_rust_wf_impl_params(CBMArena *arena, TSNode impl, const char *source) {
     TSNode self = ts_node_child_by_field_name(impl, "type", 4);
     if (ts_node_is_null(ts_node_child_by_field_name(impl, "trait", 5)) || ts_node_is_null(self) ||
         strcmp(ts_node_type(self), "generic_type") != 0)
@@ -1522,7 +1528,7 @@ static const char **pxc_rust_wf_impl_params(CBMArena *arena, TSNode root, TSNode
     if (ts_node_is_null(head) || ts_node_is_null(args) ||
         strcmp(ts_node_type(head), "type_identifier") != 0)
         return NULL;
-    TSNode decl = pxc_rust_wf_decl(root, source, cbm_node_text(arena, head, source));
+    TSNode decl = pxc_rust_wf_decl(impl, source, cbm_node_text(arena, head, source));
     if (ts_node_is_null(decl))
         return NULL;
     PXCRustWfParams impl_params;
@@ -1614,14 +1620,16 @@ static PXCRustWfImpls pxc_rust_wf_impls(CBMArena *arena, const CBMFileResult *fr
             tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
     }
     int capacity = 0;
+    bool gained = false;
     TSNode root = tree ? ts_tree_root_node(tree) : (TSNode){0};
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     for (bool more = tree != NULL; more;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char **params = strcmp(ts_node_type(node), "impl_item") == 0
-                                  ? pxc_rust_wf_impl_params(arena, root, node, source)
-                                  : NULL;
-        if (params && out.count >= capacity) {
+        bool trait_impl = strcmp(ts_node_type(node), "impl_item") == 0 &&
+                          !ts_node_is_null(ts_node_child_by_field_name(node, "trait", 5));
+        const char **params = trait_impl ? pxc_rust_wf_impl_params(arena, node, source) : NULL;
+        gained |= params != NULL;
+        if (trait_impl && out.count >= capacity) {
             capacity = capacity ? capacity * 2 : 4;
             PXCRustWfImpl *grown = cbm_arena_alloc(arena, (size_t)capacity * sizeof(*grown));
             if (grown && out.count)
@@ -1632,7 +1640,7 @@ static PXCRustWfImpls pxc_rust_wf_impls(CBMArena *arena, const CBMFileResult *fr
                 break;
             }
         }
-        if (params)
+        if (trait_impl)
             out.items[out.count++] =
                 (PXCRustWfImpl){.start_line = ts_node_start_point(node).row + 1,
                                 .end_line = ts_node_end_point(node).row + 1,
@@ -1652,19 +1660,24 @@ static PXCRustWfImpls pxc_rust_wf_impls(CBMArena *arena, const CBMFileResult *fr
     if (parser)
         ts_parser_delete(parser);
     cbm_free(CBM_MEM_CLASS_EXTRACT, owned_source);
+    if (!gained)
+        out.count = 0;
     return out;
 }
 
-/* A trait-impl method inside one of `impls` takes the impl's proof-free list. */
+/* A trait-impl method takes the proof-free list of the innermost trait impl
+ * whose span holds it; an impl nested in another's method body is its own. */
 static void pxc_rust_wf_apply(const PXCRustWfImpls *impls, const CBMDefinition *src,
                               CBMLSPDef *dst) {
+    const PXCRustWfImpl *innermost = NULL;
     for (int i = 0; src->impl_trait && i < impls->count; i++) {
-        if (src->start_line >= impls->items[i].start_line &&
-            src->start_line <= impls->items[i].end_line) {
-            dst->rust_unbounded_impl_params = impls->items[i].params;
-            return;
-        }
+        const PXCRustWfImpl *impl = &impls->items[i];
+        if (src->start_line >= impl->start_line && src->start_line <= impl->end_line &&
+            (!innermost || impl->start_line >= innermost->start_line))
+            innermost = impl;
     }
+    if (innermost && innermost->params)
+        dst->rust_unbounded_impl_params = innermost->params;
 }
 
 /* Per Rust file, the Deref impls that its file-level invocations of corpus

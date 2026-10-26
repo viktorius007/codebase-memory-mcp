@@ -1,4 +1,4 @@
-use bevy_asset::{Asset, AssetServer, Handle, Slot};
+use bevy_asset::{Asset, AssetServer, Handle, Pinned, Slot};
 
 pub struct Image;
 impl Asset for Image {}
@@ -33,10 +33,18 @@ fn slots(sound: &Slot<Sound>, image: &Slot<Image>) {
     println!("{} {}", owned.value.is_some(), borrowed.value.is_some());
 }
 
+static SOUND: Sound = Sound;
+
+fn pinned(pin: Pinned<'static, Sound>) {
+    let copy = pin.clone();
+    println!("{}", core::ptr::eq(copy.item, pin.item));
+}
+
 fn main() {
     let server = AssetServer;
     setup(&server, server.load("c.png"));
     let pipeline = Pipeline { shader: server.load("d.png") };
     pipeline.shader();
     slots(&Slot { value: None }, &Slot { value: None });
+    pinned(Pinned { item: &SOUND });
 }

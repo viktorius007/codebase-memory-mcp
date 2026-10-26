@@ -19932,21 +19932,47 @@ static void rust_register_derive_impl(CBMArena *arena, CBMTypeRegistry *reg, int
  * with any other field count keeps no target: its expansion picks the field
  * a `#[deref]` attribute marks, which the registry does not record. A generic
  * type keeps none either: its field types are not read against its params. */
+/* Whether the attribute `attr` (`#[derive(A, path::B)]`, with or without its
+ * `#[..]`) is a derive whose argument list names `name` as a path's last
+ * segment. Any other attribute, such as a doc string quoting one, is not. */
+static bool rust_attribute_derives(const char *attr, const char *name) {
+    const char *p = attr;
+    while (*p && (isspace((unsigned char)*p) || *p == '#' || *p == '['))
+        p++;
+    if (strncmp(p, "derive", strlen("derive")) != 0)
+        return false;
+    p += strlen("derive");
+    while (isspace((unsigned char)*p))
+        p++;
+    if (*p != '(')
+        return false;
+    const char *close = strchr(++p, ')');
+    size_t len = strlen(name);
+    while (close && p < close) {
+        const char *end = p;
+        while (end < close && *end != ',')
+            end++;
+        const char *last = end;
+        while (last > p && isspace((unsigned char)last[-1]))
+            last--;
+        const char *start = last;
+        while (start > p && (isalnum((unsigned char)start[-1]) || start[-1] == '_'))
+            start--;
+        const char *lead = start;
+        while (lead > p && (lead[-1] == ':' || isspace((unsigned char)lead[-1])))
+            lead--;
+        bool path = lead == start || (start - lead >= 2 && start[-1] == ':' && start[-2] == ':');
+        if (path && (size_t)(last - start) == len && strncmp(start, name, len) == 0)
+            return true;
+        p = end + 1;
+    }
+    return false;
+}
+
 static void rust_register_derived_deref(CBMRegisteredType *rt, const char *const *decorators) {
     bool derived = false;
-    for (int di = 0; decorators && decorators[di] && !derived; di++) {
-        const char *p = strstr(decorators[di], "derive");
-        const char *lparen = p ? strchr(p, '(') : NULL;
-        const char *rparen = lparen ? strchr(lparen, ')') : NULL;
-        for (const char *hit = lparen ? strstr(lparen, "Deref") : NULL; hit && hit < rparen;
-             hit = strstr(hit + 1, "Deref")) {
-            char before = hit[-1];
-            char after = hit[strlen("Deref")];
-            derived |= (before == '(' || before == ',' || before == ' ' || before == ':' ||
-                        before == '\n') &&
-                       (after == ')' || after == ',' || after == ' ' || after == '\n');
-        }
-    }
+    for (int di = 0; decorators && decorators[di] && !derived; di++)
+        derived = rust_attribute_derives(decorators[di], "Deref");
     if (!derived || rt->type_param_names) {
         return;
     }

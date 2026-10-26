@@ -36,3 +36,14 @@ impl<T: Asset + Default> Clone for Slot<T> {
         Slot { value: Some(T::default()) }
     }
 }
+
+pub struct Pinned<'a, T: Asset> {
+    pub item: &'a T,
+}
+
+impl<'a: 'static, T: Asset> Clone for Pinned<'a, T> {
+    fn clone(&self) -> Self {
+        println!("Pinned::clone\n{}", std::backtrace::Backtrace::force_capture());
+        Pinned { item: self.item }
+    }
+}
