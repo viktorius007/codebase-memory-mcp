@@ -17654,8 +17654,16 @@ static bool rust_open_trait_receiver(RustLSPContext *ctx, TSNode value, const ch
     if (!path)
         return false;
     rust_strip_turbofish(path);
-    if (!strchr(path, ':') && cbm_scope_contains(ctx->current_scope, path))
-        return false;
+    if (!strchr(path, ':') && cbm_scope_contains(ctx->current_scope, path)) {
+        /* A function item an enclosing block declares is one too; any other
+         * binding of the name (a value, an alias of a function) is not. */
+        const char *target = cbm_scope_lookup_callable(ctx->current_scope, path);
+        if (!target || strstr(target, "#cfg(") || !rust_is_block_fn_item(ctx, path, target))
+            return false;
+        if (fn_qn)
+            *fn_qn = target;
+        return true;
+    }
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
     uint32_t offset = 0;
     if (!tree || !ctx->module_qn || !rust_original_offset(ctx, value, &offset))
