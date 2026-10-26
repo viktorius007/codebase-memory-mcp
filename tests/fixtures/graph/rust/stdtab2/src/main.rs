@@ -18,6 +18,9 @@ impl<A> Assets<A> {
     pub fn slice(&self) -> &[A] { &self.list }
     pub fn first(&self) -> Option<&A> { self.list.first() }
     pub fn owned(&self) -> Vec<A> where A: Clone { self.list.clone() }
+    pub fn drained(&mut self) -> std::collections::hash_map::Drain<'_, u8, A> { self.items.drain() }
+    pub fn pairs_iter(&self) -> std::collections::hash_map::Iter<'_, u8, A> { self.items.iter() }
+    pub fn vals(&self) -> std::collections::hash_map::Values<'_, u8, A> { self.items.values() }
     pub fn res(&self) -> Result<&A, String> { self.list.first().ok_or(String::new()) }
 }
 pub struct Res<T>(T);
@@ -91,6 +94,9 @@ fn c_index_own(a: Archs) { a[ArchId(0)].m(); }
 fn c_entry_btree(m: &mut std::collections::BTreeMap<u8, Foo>) { m.entry(0).or_insert_with(|| Foo(1)).m(); }
 fn c_entry_hash(m: &mut HashMap<u8, Foo>) { m.entry(0).or_insert(Foo(1)).m(); }
 fn c_map_index_field(a: &Assets<Foo>) { a.items[&0].m(); }
+fn c_drain_ret(a: &mut Assets<Foo>) { for (_k, x) in a.drained() { x.m(); } }
+fn c_iter_ret(a: &Assets<Foo>) { for (_k, x) in a.pairs_iter() { x.m(); } }
+fn c_vals_ret(a: &Assets<Foo>) { let _: Vec<u8> = a.vals().map(|x| x.m()).collect(); }
 fn main() {
     let mut a: Assets<Foo> = Assets::default(); a.items.insert(0, Foo(1)); a.list.push(Foo(2));
     let b = Bag::new();
@@ -103,5 +109,6 @@ fn main() {
     c_assoc(&Src); c_assoc_iflet(&Src); c_generic(&Src); c_field_iter(&b); c_field_first(&b); c_field_index(&b); c_let_vec(&b); c_let_iter_chain(&b);
     c_index_ref(&Archs { v: vec![Foo(1)] }); c_index_own(Archs { v: vec![Foo(1)] });
     c_entry_btree(&mut std::collections::BTreeMap::new()); c_entry_hash(&mut HashMap::new()); c_map_index_field(&a);
+    c_iter_ret(&a); c_vals_ret(&a); c_drain_ret(&mut a);
     println!("end\n{}", std::backtrace::Backtrace::force_capture());
 }

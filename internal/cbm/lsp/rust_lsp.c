@@ -5047,6 +5047,46 @@ static bool rust_std_closure_method_known(const char *method, int arg) {
 
 /* The receiver class of `*self` (references stripped). A slice is rewritten
  * to the `Vec` of its element so the specs read `T` off it. */
+typedef struct {
+    const char *iter;
+    const char *item;
+} RustStdIterItem;
+
+static const RustStdIterItem RUST_STD_ITER_ITEMS[] = {
+#define CBM_STD_ITER_ITEM(iter, item, source) {iter, item},
+#include "rust_std_projections.h"
+#undef CBM_STD_ITER_ITEM
+    {NULL, NULL}};
+
+/* The Item of a map or set iterator rust_std_projections.h lists, over the
+ * iterator's own type arguments (T and E in the row are its first and
+ * second). A pair row ("&T,&E") yields a tuple. NULL for any other head or
+ * when an argument it needs is unknown. */
+static const CBMType *rust_std_table_iter_item(RustLSPContext *ctx, const char *qn,
+                                               const CBMType *t) {
+    if (t->kind != CBM_TYPE_TEMPLATE) {
+        return NULL;
+    }
+    for (const RustStdIterItem *row = RUST_STD_ITER_ITEMS; row->iter; row++) {
+        if (strcmp(row->iter, qn) != 0) {
+            continue;
+        }
+        const CBMType *parts[2];
+        int count = 0;
+        const char *sp = row->item;
+        while (*sp && count < 2) {
+            parts[count] = rust_std_spec_parse(ctx, &sp, t, NULL);
+            if (!parts[count] || cbm_type_is_unknown(parts[count])) {
+                return NULL;
+            }
+            count++;
+            sp += *sp == ',' ? 1 : 0;
+        }
+        return count == 2 ? cbm_type_tuple(ctx->arena, parts, 2) : count == 1 ? parts[0] : NULL;
+    }
+    return NULL;
+}
+
 static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType **self) {
     static const char *const iters[] = {"core.iter.Iterator", "std.iter.Iterator", NULL};
     static const char *const sets[] = {"std.collections.VecDeque",
@@ -5113,6 +5153,11 @@ static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType *
             item = rust_reference_type(ctx->arena, item, !strstr(qn, "IterMut"));
         }
         *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1);
+        return RUST_CLOSURE_RECV_ITER;
+    }
+    const CBMType *table_item = rust_std_table_iter_item(ctx, qn, t);
+    if (table_item) {
+        *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &table_item, 1);
         return RUST_CLOSURE_RECV_ITER;
     }
     if (rust_method_in(sets, qn)) {
