@@ -14955,6 +14955,55 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     return exact;
 }
 
+/* `Trait::m(x, ..)` where `x` is a trait object or a bounded type parameter
+ * of the enclosing item (an unregistered name a bound declares): the
+ * self type is not a concrete type with an impl, so the call names the
+ * trait's declaration of `m` (reached through supertraits; every reachable
+ * declaration must agree), as rust-analyzer resolves the path. Assumes no
+ * corpus impl of the trait has a trait-object self type. */
+static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPContext *ctx,
+                                                                      const char *trait_qn,
+                                                                      const char *method,
+                                                                      TSNode first_arg) {
+    if (ts_node_is_null(first_arg))
+        return NULL;
+    const CBMType *self_t = rust_strip_references(rust_eval_expr_type(ctx, first_arg));
+    if (!self_t)
+        return NULL;
+    bool open = self_t->kind == CBM_TYPE_TYPE_PARAM;
+    const char *head = self_t->kind == CBM_TYPE_NAMED      ? self_t->data.named.qualified_name
+                       : self_t->kind == CBM_TYPE_TEMPLATE ? self_t->data.template_type.template_name
+                                                           : NULL;
+    const CBMRegisteredType *registered = head ? cbm_registry_lookup_type(ctx->registry, head)
+                                               : NULL;
+    open |= registered && registered->is_interface && !registered->alias_of;
+    const char *leaf = head ? strrchr(head, '.') : NULL;
+    leaf = leaf ? leaf + 1 : head;
+    bool bounded_param = false;
+    for (int i = ctx->type_param_bound_count - 1; !open && leaf && i >= 0; i--)
+        bounded_param |= strcmp(ctx->type_param_bounds[i].param_name, leaf) == 0;
+    if (bounded_param) {
+        /* A blanket impl's self parameter is registered under its module;
+         * only a struct, enum or union that module declares is concrete. */
+        const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+        const char *nominal =
+            tree && registered && leaf != head
+                ? cbm_rust_modtree_resolve_nominal_type(
+                      tree, ctx->arena,
+                      cbm_arena_strndup(ctx->arena, head, (size_t)(leaf - 1 - head)), leaf)
+                : NULL;
+        open = !registered || !nominal || strcmp(nominal, head) != 0;
+    }
+    if (!open)
+        return NULL;
+    const CBMRegisteredFunc *declaration = NULL;
+    bool ambiguous = false;
+    rust_bound_trait_declarations(ctx, trait_qn, method, true, 0, NULL, &declaration, &ambiguous);
+    if (ambiguous || !declaration || (declaration->flags & CBM_FUNC_FLAG_RUST_SELF) == 0)
+        return NULL;
+    return declaration;
+}
+
 /* UFCS form `T::method` / `Trait::method` for a path already resolved to
  * `<type or trait QN>.<method>`; `callee` preserves the source spelling
  * and supplies the first argument when present. True when the call was settled (a target found or
@@ -15061,6 +15110,13 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
             rust_call_target_set(out, typed, typed->qualified_name, "lsp_trait_dispatch",
                                  CBM_RUST_CONF_UFCS);
             out->receiver_qn = typed->receiver_type;
+            return true;
+        }
+        const CBMRegisteredFunc *declared =
+            rust_trait_path_open_self_declaration(ctx, trait_qn, short_name, first_arg);
+        if (declared) {
+            rust_call_target_set(out, declared, declared->qualified_name, "lsp_bound_dispatch",
+                                 CBM_RUST_CONF_TRAIT_AMB);
             return true;
         }
         int tn = 0;
