@@ -16454,6 +16454,9 @@ static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustC
     CBMMethodIter it;
     cbm_registry_methods_chain(ctx->registry, self_qn, name, &it);
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const CBMRegisteredFunc *head_only = NULL;
+    int head_impls = 0;
+    bool exact_open = false;
     for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
         const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
         if (!candidate->impl_trait_qn || strcmp(candidate->impl_trait_qn, trait_qn) != 0)
@@ -16480,15 +16483,29 @@ static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustC
         const CBMType *impl_trait = rust_parse_def_type_text(
             ctx->arena, cbm_arena_strndup(ctx->arena, trait_part, trait_len), module, tree);
         RustImplSelfMatch match = rust_impl_self_match(ctx, impl_self, self, true, NULL);
-        if (match == RUST_IMPL_SELF_DIFFERS ||
-            rust_impl_self_match(ctx, impl_trait, trait, true, NULL) != RUST_IMPL_SELF_SAME)
+        RustImplSelfMatch trait_match = rust_impl_self_match(ctx, impl_trait, trait, true, NULL);
+        if (match == RUST_IMPL_SELF_DIFFERS || trait_match == RUST_IMPL_SELF_DIFFERS)
+            continue;
+        /* Every impl of the trait head that may apply, by impl. */
+        if (!head_only || strcmp(head_only->impl_key, candidate->impl_key) != 0)
+            head_impls++;
+        head_only = candidate;
+        if (trait_match != RUST_IMPL_SELF_SAME)
             continue;
         if (match != RUST_IMPL_SELF_SAME ||
             (selected && strcmp(selected->impl_key, candidate->impl_key) != 0))
-            return true;
+            exact_open = true;
         selected = candidate;
     }
-    if (selected) {
+    /* The written arguments may not spell the impl's (`CreateTypeData<T>`
+     * against `impl CreateTypeData<S, ()>`, `&SubEntity<L>` against `&T`):
+     * when the self type's bucket holds exactly one impl of the trait head
+     * that may apply, the compiling path names that impl. */
+    if ((exact_open || !selected) && head_impls == 1) {
+        selected = head_only;
+        exact_open = false;
+    }
+    if (selected && !exact_open) {
         rust_call_target_set(out, selected, selected->qualified_name, "lsp_ufcs",
                              CBM_RUST_CONF_UFCS);
         out->receiver_qn = self_qn;
