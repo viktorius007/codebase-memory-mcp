@@ -13,7 +13,10 @@
  *   type argument.
  * CBM_STD_ITER_ITEM(iter, item): the `Iterator::Item` of a map or set iterator
  *   type, written over its own type arguments: T the first (K, or a set's T),
- *   E the second (V); `&` shared, `!` mutable borrow; "a,b" a pair. */
+ *   E the second (V); `&` shared, `!` mutable borrow; "a,b" a pair.
+ * CBM_STD_PRODUCER(module, fn, ret, source, date): rows added to the producer
+ *   list rust_std_methods.h documents (same syntax; `~A` is the referent of the
+ *   first argument's type). */
 
 #ifdef CBM_STD_ENTRY_OF
 CBM_STD_ENTRY_OF("std.collections.HashMap", "entry", "std.collections.hash_map.Entry",
@@ -127,3 +130,9 @@ CBM_STD_ITER_ITEM("hashbrown.hash_set.Drain", "T",
                   "https://docs.rs/hashbrown/0.15/hashbrown/hash_set/struct.Drain.html#impl-Iterator-for-Drain")
 #endif
 
+#ifdef CBM_STD_PRODUCER
+CBM_STD_PRODUCER("mem", "take", "~A", "https://doc.rust-lang.org/std/mem/fn.take.html",
+                 "2026-10-26")
+CBM_STD_PRODUCER("mem", "replace", "~A", "https://doc.rust-lang.org/std/mem/fn.replace.html",
+                 "2026-10-26")
+#endif

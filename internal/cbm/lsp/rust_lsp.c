@@ -4346,6 +4346,7 @@ typedef struct {
 static const RustStdProducer RUST_STD_PRODUCERS[] = {
 #define CBM_STD_PRODUCER(receiver, method, ret, source, date) {receiver "." method, ret},
 #include "rust_std_methods.h"
+#include "rust_std_projections.h"
 #undef CBM_STD_PRODUCER
     {NULL, NULL}};
 
