@@ -16520,6 +16520,10 @@ static const char *rust_unbracketed_path(RustLSPContext *ctx, TSNode callee) {
     return cbm_arena_sprintf(ctx->arena, "%s::%s", type_path, item);
 }
 
+static const CBMRegisteredFunc *rust_sole_blanket_impl_method(RustLSPContext *ctx,
+                                                              const char *type_qn,
+                                                              const char *name);
+
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
  * the file-layout fallbacks (file outside every crate, undecidable name).
@@ -16593,6 +16597,13 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
         out->names_function = true;
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", r.qn, r.assoc);
         if (!rust_ufcs_target(ctx, qn, callee, out)) {
+            const CBMRegisteredFunc *blanket =
+                r.is_trait ? NULL : rust_sole_blanket_impl_method(ctx, r.qn, r.assoc);
+            if (blanket) {
+                rust_call_target_set(out, blanket, blanket->qualified_name, "lsp_trait_dispatch",
+                                     CBM_RUST_CONF_UFCS);
+                return true;
+            }
             out->open_qn = qn;
             out->open_reason = "associated_item_not_registered";
         }
@@ -17436,6 +17447,81 @@ static const CBMRegisteredFunc *rust_sole_in_scope_trait_declaration(RustLSPCont
         if (selected && strcmp(selected->qualified_name, declared->qualified_name) != 0)
             return NULL;
         selected = declared;
+    }
+    return selected;
+}
+
+/* The method a blanket impl over a bare parameter `T` written beside trait
+ * `trait_qn` (`impl<T: Bound> Trait for T`) defines as `name`; NULL when
+ * none or two. */
+static const CBMRegisteredFunc *rust_trait_blanket_method(RustLSPContext *ctx,
+                                                          const char *trait_qn,
+                                                          const char *name) {
+    const char *dot = strrchr(trait_qn, '.');
+    if (!dot)
+        return NULL;
+    const char *param = cbm_arena_sprintf(ctx->arena, "%.*s.T", (int)(dot - trait_qn), trait_qn);
+    const CBMRegisteredFunc *selected = NULL;
+    CBMMethodIter methods;
+    cbm_registry_methods_chain(ctx->registry, param, name, &methods);
+    for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
+        const CBMRegisteredFunc *f = &methods.reg->funcs[mi];
+        bool blanket = false;
+        for (int k = 0; f->rust_impl_type_params && f->rust_impl_type_params[k]; k++)
+            blanket |= strcmp(f->rust_impl_type_params[k], "T") == 0;
+        if (!blanket || (f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !f->impl_trait_qn ||
+            !rust_trait_qn_same(f->impl_trait_qn, trait_qn))
+            continue;
+        if (selected && strcmp(selected->qualified_name, f->qualified_name) != 0)
+            return NULL;
+        selected = f;
+    }
+    return selected;
+}
+
+/* `Type::name` where the project type `Type` registers no `name`: among the
+ * in-scope corpus traits declaring `name`, `Type` implements none itself and
+ * exactly one has a blanket impl over a bare parameter defining `name`
+ * (`impl<T: Bound> Trait for T`). That method is the callee: a compiling call
+ * reaches `name` through an impl of an in-scope trait; an impl on another
+ * concrete head cannot cover `Type`, and coherence lets nothing beside the
+ * blanket cover it for that trait. Named assumptions: no dependency trait in
+ * scope declares `name`, and a blanket is written with parameter `T` beside
+ * its trait (one written otherwise is not seen, and the call may link the
+ * other trait's blanket). */
+static const CBMRegisteredFunc *rust_sole_blanket_impl_method(RustLSPContext *ctx,
+                                                              const char *type_qn,
+                                                              const char *name) {
+    for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
+        if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], name) == 0)
+            return NULL;
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!type || type->is_interface || type->alias_of)
+        return NULL;
+    const CBMRegisteredFunc *selected = NULL;
+    CBMTypeShortIter it;
+    cbm_registry_all_types_chain(ctx->registry, &it);
+    for (int ti; (ti = cbm_type_short_iter_next(&it)) >= 0;) {
+        const CBMRegisteredType *trait = &it.reg->types[ti];
+        if (!trait->is_interface || trait->alias_of || !trait->qualified_name ||
+            rust_qn_has_facade_root(trait->qualified_name))
+            continue;
+        CBMMethodIter methods;
+        cbm_registry_methods_chain(ctx->registry, trait->qualified_name, name, &methods);
+        bool declared = false;
+        for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;)
+            declared |= (methods.reg->funcs[mi].flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0;
+        if (!declared || rust_trait_out_of_scope(ctx, trait->qualified_name, name, NULL, NULL))
+            continue;
+        for (int i = 0; type->embedded_types && type->embedded_types[i]; i++)
+            if (rust_trait_qn_same(type->embedded_types[i], trait->qualified_name))
+                return NULL; /* its own impl of a trait declaring `name` */
+        const CBMRegisteredFunc *blanket = rust_trait_blanket_method(ctx, trait->qualified_name, name);
+        if (!blanket)
+            continue;
+        if (selected && strcmp(selected->qualified_name, blanket->qualified_name) != 0)
+            return NULL;
+        selected = blanket;
     }
     return selected;
 }

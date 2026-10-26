@@ -1,0 +1,1 @@
+Lane w6-recv (2026-10-26): `Type::name()` reaching `name` only through a blanket impl over a bare parameter (bevy `Children::spawn` through `impl<T: RelationshipTarget> SpawnRelated for T`), beside a second in-scope trait declaring `name` with impls on other heads. println! statements print a backtrace (the run is the truth).
