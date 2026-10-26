@@ -10929,25 +10929,40 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         const CBMRegisteredFunc *by_reference =
             rust_reference_impl_default(ctx, receiver_type_qn, method_name, &via);
         bool proved = false;
-        if (by_reference && via &&
+        CBMRegisteredFunc *inherited =
+            by_reference && via ? cbm_arena_alloc(ctx->arena, sizeof(*inherited)) : NULL;
+        if (inherited &&
             (!require_scope || !rust_trait_out_of_scope(ctx, by_reference->receiver_type,
                                                         method_name, NULL, inh ? &proved : NULL)) &&
             (!inh || proved)) {
+            /* The default as the impl inherits it: the declaration's own
+             * receiver form at the impl's written reference self type, so the
+             * probe ranks this method, not the one that witnessed the impl. */
+            *inherited = *by_reference;
+            inherited->receiver_type = via->receiver_type;
+            inherited->flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
+            inherited->impl_trait_qn = via->impl_trait_qn;
+            inherited->impl_key = via->impl_key;
+            inherited->rust_reference_impl_self = via->rust_reference_impl_self;
+            inherited->rust_impl_type_params = via->rust_impl_type_params;
+            inherited->rust_unbounded_impl_params = via->rust_unbounded_impl_params;
+            inherited->type_param_names = via->type_param_names;
             const CBMRegisteredFunc *selected = rust_method_probe_choice(
-                ctx, inh, via, recv, method_name, require_scope, &scope_filtered, stop);
-            if (selected && selected == via) {
-                if (out_impl_count)
-                    *out_impl_count = 1;
+                ctx, inh, inherited, recv, method_name, require_scope, &scope_filtered, stop);
+            if (!selected)
+                return NULL;
+            if (out_impl_count)
+                *out_impl_count = 1;
+            if (selected == inherited) {
                 if (out_trait_dispatch)
                     *out_trait_dispatch = true;
                 return by_reference;
             }
-            if (selected && selected == inh) {
-                if (out_impl_count)
-                    *out_impl_count = 1;
-                return inh;
-            }
-            return NULL;
+            /* An inherent method, or another trait's reference override the
+             * probe ranked earlier, is the callee. */
+            if (out_trait_dispatch && selected != inh)
+                *out_trait_dispatch = true;
+            return selected;
         }
     }
     if (default_method && unregistered_method) {

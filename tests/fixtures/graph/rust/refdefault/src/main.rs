@@ -18,6 +18,33 @@ mod system {
         }
     }
 
+    pub struct Pair;
+
+    pub trait Touch: Sized {
+        fn touch(&mut self) -> u32 {
+            println!("Touch::touch\n{}", std::backtrace::Backtrace::force_capture());
+            0
+        }
+        fn witness(self) -> u32;
+    }
+
+    impl Touch for &mut Pair {
+        fn witness(self) -> u32 {
+            1
+        }
+    }
+
+    pub trait Look {
+        fn touch(&self) -> u32;
+    }
+
+    impl Look for &mut Pair {
+        fn touch(&self) -> u32 {
+            println!("Look::touch\n{}", std::backtrace::Backtrace::force_capture());
+            2
+        }
+    }
+
     pub struct Both;
 
     pub trait Describe: Sized {
@@ -42,11 +69,17 @@ mod system {
 }
 
 mod app {
-    use crate::system::{Both, Describe, RunSystemOnce as _, World};
+    use crate::system::{Both, Describe, Look as _, Pair, RunSystemOnce as _, Touch as _, World};
 
     pub fn run() -> u32 {
         let mut world = World { runs: 0 };
         world.run_system_once(3)
+    }
+
+    pub fn pair() -> u32 {
+        let mut pair = Pair;
+        let borrowed = &mut pair;
+        borrowed.touch()
     }
 
     pub fn both() -> u32 {
@@ -56,5 +89,5 @@ mod app {
 }
 
 fn main() {
-    println!("{} {}", app::run(), app::both());
+    println!("{} {} {}", app::run(), app::both(), app::pair());
 }
