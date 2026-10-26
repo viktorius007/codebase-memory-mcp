@@ -2,6 +2,7 @@
 //! across crates, and a child module's `use super::*`.
 use facade::prelude::*;
 
+mod beside_std_glob;
 mod checks;
 
 fn one() -> u32 {
@@ -22,4 +23,5 @@ fn spawn_two() {
 fn main() {
     spawn_two();
     checks::run();
+    beside_std_glob::run();
 }

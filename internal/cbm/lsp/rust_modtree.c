@@ -1857,7 +1857,7 @@ static bool rmt_use_proves_extern(const CBMRustModTree *tree, int module, const 
 }
 
 static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head, uint8_t ns,
-                             bool is_use, RmtDefs *out, bool building) {
+                             bool is_use, bool macro_path, RmtDefs *out, bool building) {
     int crate = tree->modules[module].crate;
     RmtVisit visit = {.count = 0};
     int scope = is_use && (tree->crates[crate].edition == CBM_RUST_EDITION_2015)
@@ -1872,10 +1872,12 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
      * project crate and a language crate (`std`, `core`, ...) are settled
      * this way, so a `use` of either names the same item in every module.
      * A dependency crate is not: its items publish nothing, and impl
-     * receivers keep its type names file-local. */
+     * receivers keep its type names file-local. The head of a macro path is
+     * resolved during expansion like a `use` path, under the same E0659
+     * rule (glob import vs outer scope during import/macro resolution). */
     if (out->open && out->count == 0 && !(tree->crates[crate].edition == CBM_RUST_EDITION_2015) &&
         (ns & RMT_NS_TYPE) && rmt_implicit_extern_allowed(tree, module, head) &&
-        (is_use || rmt_use_proves_extern(tree, module, head)) &&
+        (is_use || macro_path || rmt_use_proves_extern(tree, module, head)) &&
         rmt_extern_prelude(tree, crate, head, &def, building) &&
         (def.kind == RMT_MODULE || rmt_in_list(RMT_LANGUAGE_CRATES, head))) {
         *out = (RmtDefs){0};
@@ -1933,8 +1935,8 @@ static int rmt_start(CBMRustModTree *tree, int module, const char *const *segs, 
         cur->open = true;
         return -1;
     }
-    rmt_resolve_head(tree, module, head, count == 1 ? final_ns : RMT_NS_TYPE, is_use, cur,
-                     building);
+    rmt_resolve_head(tree, module, head, count == 1 ? final_ns : RMT_NS_TYPE, is_use,
+                     final_ns == RMT_NS_MACRO, cur, building);
     return 1;
 }
 
