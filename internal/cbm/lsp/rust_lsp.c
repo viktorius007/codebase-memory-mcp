@@ -20081,6 +20081,8 @@ static bool rust_attribute_derives(const char *attr, const char *name) {
     const char *close = strchr(++p, ')');
     size_t len = strlen(name);
     while (close && p < close) {
+        while (p < close && isspace((unsigned char)*p))
+            p++;
         const char *end = p;
         while (end < close && *end != ',')
             end++;
@@ -20090,10 +20092,7 @@ static bool rust_attribute_derives(const char *attr, const char *name) {
         const char *start = last;
         while (start > p && (isalnum((unsigned char)start[-1]) || start[-1] == '_'))
             start--;
-        const char *lead = start;
-        while (lead > p && (lead[-1] == ':' || isspace((unsigned char)lead[-1])))
-            lead--;
-        bool path = lead == start || (start - lead >= 2 && start[-1] == ':' && start[-2] == ':');
+        bool path = start == p || (start - p >= 2 && start[-1] == ':' && start[-2] == ':');
         if (path && (size_t)(last - start) == len && strncmp(start, name, len) == 0)
             return true;
         p = end + 1;
