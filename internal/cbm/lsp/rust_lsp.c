@@ -16360,15 +16360,15 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_unresolved_call(ctx, mname, "trait_scope_identity");
                 return;
             }
-            /* Prelude trait method best-effort. */
-            if (is_prelude_trait_method(mname)) {
-                rust_emit_resolved_call(ctx,
-                                        cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
-                                        NULL, "lsp_prelude_trait", CBM_RUST_CONF_TRAIT_AMB);
-                return;
-            }
+            /* A prelude trait name on a receiver with no method of that name
+             * proves no target: `<type>.<method>` names no item. Published as
+             * a resolution it would make the site ambiguous against the
+             * project pass's inherent hit (`query.iter()` on a `Query` read
+             * only through a file-local placeholder), so it stays unresolved. */
             rust_emit_unresolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
-                                      "method_not_found");
+                                      is_prelude_trait_method(mname)
+                                          ? "prelude_trait_method_not_proven"
+                                          : "method_not_found");
             return;
         }
 
