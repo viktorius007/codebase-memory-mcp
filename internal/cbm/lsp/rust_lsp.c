@@ -4715,11 +4715,166 @@ static const char *rust_std_type_head(const CBMType *t) {
     return NULL;
 }
 
+/* ── bevy `Query<D, F>` items ──────────────────────────────────────────
+ * bevy_ecs declares the item of a query through `QueryData::Item`, a
+ * generic associated type the impls spell per shape (crates/bevy_ecs/src/
+ * query/fetch.rs) and partly through macros (tuples). The rule below is the
+ * closed reading of those impls: `&T` yields `&T`, `&mut T` yields
+ * `Mut<T>` (`&T` when read-only), `Entity` yields `Entity`, `Has<T>` yields
+ * `bool`, `Ref<T>` yields `Ref<T>`, `Option<D>` yields `Option` of D's item
+ * and a tuple yields the tuple of its items. Any other shape, a derived
+ * `QueryData` struct included, has no item here. The types are recognised
+ * by their place in bevy_ecs's own source tree. */
+#define RUST_BEVY_ECS_SRC "crates.bevy_ecs.src."
+enum { RUST_BEVY_ITEM_MAX_DEPTH = 8 };
+
+/* The registered QN of `t`'s head when it is bevy_ecs's `<path>` (a path
+ * under crates/bevy_ecs/src), else NULL. `*ecs` receives the QN prefix
+ * that ends in `crates.bevy_ecs.src.`. */
+static const char *rust_bevy_ecs_type(RustLSPContext *ctx, const CBMType *t, const char *path,
+                                      const char **ecs) {
+    const char *head = rust_std_type_head(t);
+    const char *qn = head ? rust_registered_type_qn(ctx, head) : NULL;
+    if (!qn) {
+        return NULL;
+    }
+    const char *suffix = cbm_arena_sprintf(ctx->arena, "%s%s", RUST_BEVY_ECS_SRC, path);
+    size_t qn_len = strlen(qn);
+    size_t suffix_len = strlen(suffix);
+    if (qn_len < suffix_len || strcmp(qn + qn_len - suffix_len, suffix) != 0 ||
+        (qn_len > suffix_len && qn[qn_len - suffix_len - 1] != '.')) {
+        return NULL;
+    }
+    if (ecs) {
+        *ecs = cbm_arena_strndup(ctx->arena, qn, qn_len - strlen(path));
+    }
+    return qn;
+}
+
+static const CBMType *rust_bevy_query_item(RustLSPContext *ctx, const char *ecs,
+                                           const CBMType *data, bool read_only, int depth);
+
+static const CBMType *rust_bevy_query_item_or_unknown(RustLSPContext *ctx, const char *ecs,
+                                                      const CBMType *data, bool read_only,
+                                                      int depth) {
+    const CBMType *item = rust_bevy_query_item(ctx, ecs, data, read_only, depth);
+    return item ? item : cbm_type_unknown();
+}
+
+/* The item a query with data `data` yields, or NULL for a shape the rule
+ * does not cover. `read_only` reads `D::ReadOnly`'s item instead. */
+static const CBMType *rust_bevy_query_item(RustLSPContext *ctx, const char *ecs,
+                                           const CBMType *data, bool read_only, int depth) {
+    data = rust_expand_type_aliases(ctx, data, 0);
+    if (!data || depth > RUST_BEVY_ITEM_MAX_DEPTH) {
+        return NULL;
+    }
+    if (data->kind == CBM_TYPE_REFERENCE) {
+        const CBMType *elem = data->data.reference.elem;
+        if (data->data.reference.rust_shared || (read_only && data->data.reference.rust_mutable)) {
+            return rust_reference_type(ctx->arena, elem, true);
+        }
+        const char *mut_qn = data->data.reference.rust_mutable
+                                 ? cbm_arena_sprintf(ctx->arena, "%schange_detection.params.Mut",
+                                                     ecs)
+                                 : NULL;
+        return mut_qn && cbm_registry_lookup_type(ctx->registry, mut_qn)
+                   ? cbm_type_template(ctx->arena, mut_qn, &elem, 1)
+                   : NULL;
+    }
+    if (data->kind == CBM_TYPE_TUPLE) {
+        int n = data->data.tuple.count;
+        if (n <= 0) {
+            return NULL;
+        }
+        const CBMType **items = cbm_arena_alloc(ctx->arena, sizeof(*items) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            items[i] = rust_bevy_query_item_or_unknown(ctx, ecs, data->data.tuple.elems[i],
+                                                       read_only, depth + 1);
+        }
+        return cbm_type_tuple(ctx->arena, items, n);
+    }
+    const char *head = rust_std_type_head(data);
+    if (!head) {
+        return NULL;
+    }
+    bool one_arg = data->kind == CBM_TYPE_TEMPLATE && data->data.template_type.arg_count == 1;
+    if (one_arg && rust_std_family_of(ctx, head) == RUST_STD_OPTION) {
+        const CBMType *inner = rust_bevy_query_item_or_unknown(
+            ctx, ecs, data->data.template_type.template_args[0], read_only, depth + 1);
+        return cbm_type_template(ctx->arena, "core.option.Option", &inner, 1);
+    }
+    if (rust_bevy_ecs_type(ctx, data, "entity.mod.Entity", NULL) ||
+        (one_arg && rust_bevy_ecs_type(ctx, data, "change_detection.params.Ref", NULL))) {
+        return data;
+    }
+    if (one_arg && rust_bevy_ecs_type(ctx, data, "query.fetch.Has", NULL)) {
+        return cbm_type_builtin(ctx->arena, "bool");
+    }
+    return NULL;
+}
+
+/* The Item a bevy query iterator yields, through `trait`: `QueryIter<D, F>`
+ * as an Iterator yields D's item (its D is already `D::ReadOnly` when the
+ * query lent it read-only); `&Query`, `&mut Query` and `Query` as an
+ * IntoIterator yield the read-only, the mutable and the owned item. NULL
+ * when `self` is neither; unknown when its data has no item here. */
+static const CBMType *rust_bevy_query_iter_item(RustLSPContext *ctx, const CBMType *self,
+                                                const char *trait) {
+    const CBMType *base = rust_strip_references(self);
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 1) {
+        return NULL;
+    }
+    const CBMType *data = base->data.template_type.template_args[0];
+    const char *ecs = NULL;
+    if (rust_bevy_ecs_type(ctx, base, "query.iter.QueryIter", &ecs)) {
+        return rust_bevy_query_item_or_unknown(ctx, ecs, data, false, 0);
+    }
+    if (strcmp(trait, "core.iter.IntoIterator") != 0 ||
+        !rust_bevy_ecs_type(ctx, base, "system.query.Query", &ecs)) {
+        return NULL;
+    }
+    bool read_only = self->kind == CBM_TYPE_REFERENCE && !self->data.reference.rust_mutable;
+    return rust_bevy_query_item_or_unknown(ctx, ecs, data, read_only, 0);
+}
+
+/* `D::ReadOnly` for the closed shapes: every `&mut T` read as `&T`. */
+static const CBMType *rust_bevy_query_read_only(RustLSPContext *ctx, const CBMType *data,
+                                                int depth) {
+    data = rust_expand_type_aliases(ctx, data, 0);
+    if (!data || depth > RUST_BEVY_ITEM_MAX_DEPTH) {
+        return data;
+    }
+    if (data->kind == CBM_TYPE_REFERENCE && data->data.reference.rust_mutable) {
+        return rust_reference_type(ctx->arena, data->data.reference.elem, true);
+    }
+    if (data->kind == CBM_TYPE_TUPLE && data->data.tuple.count > 0) {
+        int n = data->data.tuple.count;
+        const CBMType **elems = cbm_arena_alloc(ctx->arena, sizeof(*elems) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            elems[i] = rust_bevy_query_read_only(ctx, data->data.tuple.elems[i], depth + 1);
+        }
+        return cbm_type_tuple(ctx->arena, elems, n);
+    }
+    const char *head = rust_std_type_head(data);
+    if (head && data->kind == CBM_TYPE_TEMPLATE && data->data.template_type.arg_count == 1 &&
+        rust_std_family_of(ctx, head) == RUST_STD_OPTION) {
+        const CBMType *inner =
+            rust_bevy_query_read_only(ctx, data->data.template_type.template_args[0], depth + 1);
+        return cbm_type_template(ctx->arena, "core.option.Option", &inner, 1);
+    }
+    return data;
+}
+
 /* Exactly one written impl must match the full self shape. Generic impls
  * whose applicability was not proved poison the lookup rather than guessing. */
 static const CBMType *rust_written_iter_item(RustLSPContext *ctx, const CBMType *self,
                                              const char *trait) {
     self = rust_expand_type_aliases(ctx, self, 0);
+    const CBMType *query_item = rust_bevy_query_iter_item(ctx, self, trait);
+    if (query_item) {
+        return query_item;
+    }
     const CBMType *base = self;
     while (base && base->kind == CBM_TYPE_REFERENCE) {
         base = base->data.reference.elem;
@@ -5469,9 +5624,56 @@ static const CBMType *rust_collect_written_type(RustLSPContext *ctx, TSNode type
 /* Type of a call expression. `*callee`, when the call names a registered
  * function or method, is that function: `.await` reads its async flag. A
  * declared type alias in the result reads as the type it stands for. */
+/* The result of a bevy `Query<D, F>` method whose declared return spells
+ * D through a projection (`QueryIter<'_, 's, D::ReadOnly, F>`): `iter` /
+ * `iter_mut` keep the declared `QueryIter` with the read-only or the
+ * mutable data as its D. NULL for any other call. */
+static const CBMType *rust_bevy_query_call_return(RustLSPContext *ctx, TSNode node,
+                                                  const CBMRegisteredFunc *callee,
+                                                  const CBMType *declared) {
+    static const char *const iterators[] = {"iter", "iter_mut", NULL};
+    if (!callee || !callee->receiver_type || !callee->short_name || !declared ||
+        declared->kind != CBM_TYPE_TEMPLATE || declared->data.template_type.arg_count < 1) {
+        return NULL;
+    }
+    const char *name = callee->short_name;
+    if (!rust_method_in(iterators, name)) {
+        return NULL;
+    }
+    TSNode func = ts_node_child_by_field_name(node, "function", 8);
+    TSNode value = ts_node_is_null(func) || strcmp(ts_node_type(func), "field_expression") != 0
+                       ? (TSNode){0}
+                       : ts_node_child_by_field_name(func, "value", 5);
+    if (ts_node_is_null(value)) {
+        return NULL;
+    }
+    const CBMType *query =
+        rust_strip_references(rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0));
+    const char *ecs = NULL;
+    const char *owner = query && query->kind == CBM_TYPE_TEMPLATE &&
+                                query->data.template_type.arg_count > 0
+                            ? rust_bevy_ecs_type(ctx, query, "system.query.Query", &ecs)
+                            : NULL;
+    if (!owner || strcmp(owner, callee->receiver_type) != 0) {
+        return NULL;
+    }
+    const CBMType *data = query->data.template_type.template_args[0];
+    if (strcmp(name, "iter") == 0) {
+        data = rust_bevy_query_read_only(ctx, data, 0);
+    }
+    int n = declared->data.template_type.arg_count;
+    const CBMType **args = cbm_arena_alloc(ctx->arena, sizeof(*args) * (size_t)n);
+    memcpy(args, declared->data.template_type.template_args, sizeof(*args) * (size_t)n);
+    args[0] = data;
+    return cbm_type_template(ctx->arena, declared->data.template_type.template_name, args, n);
+}
+
 static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
                                           const CBMRegisteredFunc **callee) {
-    return rust_expand_type_aliases(ctx, rust_eval_call_type_of(ctx, node, callee), 0);
+    const CBMType *declared =
+        rust_expand_type_aliases(ctx, rust_eval_call_type_of(ctx, node, callee), 0);
+    const CBMType *query = rust_bevy_query_call_return(ctx, node, *callee, declared);
+    return query ? query : declared;
 }
 
 /* ── Type parameters a call's arguments fix ─────────────────────────
