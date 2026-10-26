@@ -1,4 +1,12 @@
+macro_rules! gate {
+    ($($t:tt)*) => {};
+}
+gate! {
+    mod dep;
+}
+use dep::Thing;
 use plat::collections::{HashMap, HashSet};
+pub fn dropped(x: &Thing) { x.ping(); }
 pub struct Holder { m: HashMap<u32, u32>, s: HashSet<u32> }
 impl Holder {
     pub fn put(&mut self) { self.m.insert(1, 2); }
@@ -14,6 +22,6 @@ pub fn by_path(m: &plat::collections::HashMap<u32, u32>) -> bool { m.get(&5).is_
 fn main() {
     let mut h = Holder { m: HashMap::new(), s: HashSet::new() };
     h.put(); h.look(); h.mark(); h.seen();
-    by_param(&mut h.m); by_set_param(&h.s); by_local(); by_ctor(); by_path(&h.m);
+    by_param(&mut h.m); by_set_param(&h.s); by_local(); by_ctor(); by_path(&h.m); dropped(&Thing);
     println!("end\n{}", std::backtrace::Backtrace::force_capture());
 }
