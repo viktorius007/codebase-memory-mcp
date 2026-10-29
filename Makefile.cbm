@@ -1404,8 +1404,11 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 # and scripts/env.sh exports one while a direct make uses the other, which
 # must not rebuild everything. STATIC=1 changes only the link, and is here so
 # the binary relinks.
-CC_IDENTITY := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -E '__VERSION__|__clang__|__x86_64__|__aarch64__|__arm64__|_WIN32|__APPLE__' | sort | sed 's/^#define //' | tr -d '"' | tr -s ' \n' ' ')
-CXX_IDENTITY := $(shell echo | $(CXX) -x c++ -dM -E - 2>/dev/null | grep -E '__VERSION__|__clang__|__x86_64__|__aarch64__|__arm64__|_WIN32|__APPLE__' | sort | sed 's/^#define //' | tr -d '"' | tr -s ' \n' ' ')
+# GNU Make before 4.3 (macOS ships 3.81) reads a literal # inside a function
+# call as a comment, so the sed pattern takes it from a variable.
+HASH := \#
+CC_IDENTITY := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -E '__VERSION__|__clang__|__x86_64__|__aarch64__|__arm64__|_WIN32|__APPLE__' | sort | sed 's/^$(HASH)define //' | tr -d '"' | tr -s ' \n' ' ')
+CXX_IDENTITY := $(shell echo | $(CXX) -x c++ -dM -E - 2>/dev/null | grep -E '__VERSION__|__clang__|__x86_64__|__aarch64__|__arm64__|_WIN32|__APPLE__' | sort | sed 's/^$(HASH)define //' | tr -d '"' | tr -s ' \n' ' ')
 BUILD_CONFIG_SIG := CC=$(CC_IDENTITY)|CXX=$(CXX_IDENTITY)|TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|MEMWASTE=$(MEMWASTE)|MEMWASTE_ACCESS=$(MEMWASTE_ACCESS)|MEMWASTE_PROFILE=$(MEMWASTE_PROFILE)|TEST_COVERAGE=$(TEST_COVERAGE)|STATIC=$(STATIC)
 # The test flavour's own stamp, so a TEST_SEAMS or version flip of the product
 # build leaves the test runner's objects alone (TEST_SEAMS does not reach
