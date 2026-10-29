@@ -398,6 +398,102 @@ which is what rules out a stale-index explanation.
 
 ---
 
+# Verified against the installed build, 2026-10-29
+
+Binary: `~/.local/bin/codebase-memory-mcp` built from `c73b9e6b`. Corpus:
+`/Users/viktor/Developer/project-management` at `becf78233e` (33,477 nodes /
+174,798 edges, `--mode full`), checked against grep and direct file reads. A
+three-line scratch crate isolated the macro case. Every call ran through the
+one-shot CLI.
+
+Still reproducing from the 2026-09-20 pass: `packages` reports every crate's
+`fan_in`/`fan_out` as 0 (`layers` likewise calls `pm-cli` and `pm-domain`
+`fan-in=0, fan-out=0`), and degree-0 dead-code hits are mostly live: 3 of 4
+sampled are used from a `const` initializer (`decimal_power_of_ten`), a serde
+attribute string (`default_actor_type`) or `let _ = f;`. Semantic ranking is
+still off-topic, with every score near 0.98.
+
+Sound: 300 of 300 random CALLS edges name a callee present at the call site;
+`delete_req` callers are exact (3 of 3); `search_code` literal counts equal
+`git grep -F` on indexed files; the reported 2-cycle `base_module` ↔
+`absolutize` is real; `ORDER BY … DESC LIMIT n` matches a full count.
+
+## macro_rules! output has no nodes, and coverage reports nothing
+
+Items a macro template generates are absent: the 20 `string_enum!` enums,
+including `IssueStatus`, `EntityKind` and `Actor`, the `impl_decision_entity_slot!`
+store methods, and the `register_backend_contracts!` test wrappers. In the
+scratch crate, `make_widget!(Gizmo)` yields neither `Gizmo` nor `Gizmo::spin`.
+Only valid Rust written inside an invocation body is parsed. Calls to the
+missing items have no target. `check_index_coverage` on
+`crates/pm-domain-vocab/src/entity/entity_kind.rs` reports `no_recorded_issue`.
+Fix the signal first: report invocations whose expansion was not materialised.
+
+## Rust IMPLEMENTS edges cover 41% of trait impls
+
+151 edges against 367 `impl <LocalTrait> for <NamedType>` blocks; e.g.
+`InMemoryEventRecorder` → `EventRecorder` has no edge although both nodes exist.
+Disclosed as `impl_relationships_unavailable`. The impl methods' qualified names
+carry `[EventRecorder]`, so the data exists to emit the edge.
+
+## get_code_snippet on a File node stops at line 51
+
+`get_code_snippet --qualified-name crates.pm-domain.src.status.rs.__file__`
+returns lines 1–51 of a 235-line file; with `--source-mode full` it does so
+without `source_truncated`. `--start-line 85` is ignored (lines 1–3 return).
+The Module node returns correct ranges.
+
+## compare_graphs reports every node as changed
+
+Two projects indexed from clones that differ by one function return 19 added and
+18 removed nodes: identities include the project-name prefix, so no node
+matches. Strip the prefix or document the tool as cross-project only.
+
+## system_structure never completes from the CLI
+
+`get_architecture --aspects system_structure` returns `status: pending` with the
+same generation on every poll — 50 polls over about 70 seconds, with and without
+a running daemon. Complete it synchronously in `cli` or return an error naming
+the requirement.
+
+## Silent argument handling
+
+- `trace_path`/`detect_changes` `--depth 16` (or 99) is clamped to 15 with exit 0
+  and no warning in the response; `--depth 0` returns zero rows.
+- `get_code_snippet --start-line` outside the symbol returns the whole symbol.
+- Cypher booleans match only bare `true`/`false`; `= 'true'` and `= 1` return
+  zero rows with no warning. `type(r)` fails in `WHERE` but works in `RETURN`.
+- `search_code` and `not_indexed` omit unparsed file types (`.snap`, `.txt`,
+  `.jsonl`) from every listing; `check_index_coverage` on one reports
+  `status: no_recorded_issue` beside `freshness: not_tracked`.
+
+## Smaller gaps
+
+- `SPAWNS` comes from Python and shell only; 106 Rust `Command::new("git")`
+  sites produce none.
+- Every `trace_path` tree response embeds a project-wide `unresolved_sites` JSON
+  string (~2 KB) even for a one-row answer.
+- `ingest_traces` stores pairs that no CLI or MCP tool reads back.
+
+## Assessment and fix order
+
+As a first-stop exploration tool: 8/10 — edges and counts are trustworthy and
+calls take 0.27–2.3 s. For negative claims ("unused", "nothing implements",
+"does not exist"): 5/10, because the gaps above are silent. Fix silent wrong
+answers before visible failures:
+
+1. macro_rules! output — report the gap in coverage, then materialise it.
+2. File-node snippet truncation — wrong source where source is ground truth.
+3. `packages`/`layers` zero fan-in/out — the first architecture view misleads.
+4. IMPLEMENTS coverage — disclosed and has a workaround, so after 1–3.
+5. Warnings for clamped and ignored arguments.
+6. `compare_graphs` identity prefix — obviously wrong, so low harm.
+7. `system_structure` in the CLI — obviously broken, not misleading.
+8. `unresolved_sites` noise — cost, not correctness.
+9. Rust `SPAWNS`.
+
+---
+
 # Deferred maintenance items
 
 ## File and fix two diagnostic-gap flakes (own issues)
